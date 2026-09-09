@@ -71,6 +71,7 @@ class DummyContainer:
         _disconnect_handler,
         _mm_embeddings,
         filter_trigger=None,
+        label=None,
     ):
         self.request_ids.append(request_id)
         chunks = self.attempts[len(self.request_ids) - 1]
