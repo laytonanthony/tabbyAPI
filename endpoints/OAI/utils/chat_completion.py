@@ -54,6 +54,11 @@ from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_usage_stats
 # an explicit stream error rather than loop forever.
 TOOL_CALL_PARSE_RETRIES = 1
 
+# A repair attempt only needs enough room to emit one corrected call. Leaving
+# max_tokens unset inherits the full remaining context window, which can keep a
+# buffered retry silent for many minutes and trip downstream SSE idle timers.
+TOOL_CALL_RETRY_MAX_TOKENS = 4096
+
 
 def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
     """
@@ -689,6 +694,11 @@ async def _chat_stream_collector(
     try:
         for attempt in range(TOOL_CALL_PARSE_RETRIES + 1):
             attempt_params = params.model_copy(deep=True)
+            if attempt > 0:
+                attempt_params.max_tokens = min(
+                    attempt_params.max_tokens or TOOL_CALL_RETRY_MAX_TOKENS,
+                    TOOL_CALL_RETRY_MAX_TOKENS,
+                )
             backend_request_id = (
                 request_id if attempt == 0 else f"{request_id}-toolretry{attempt}"
             )

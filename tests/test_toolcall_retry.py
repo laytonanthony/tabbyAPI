@@ -16,9 +16,10 @@ VALID = (
 )
 
 
-def request_with_tool():
+def request_with_tool(max_tokens=None):
     return ChatCompletionRequest(
         messages=[{"role": "user", "content": "run dir"}],
+        max_tokens=max_tokens,
         tool_choice="auto",
         tools=[
             ToolSpec(
@@ -61,6 +62,7 @@ class DummyContainer:
     def __init__(self, attempts):
         self.attempts = list(attempts)
         self.request_ids = []
+        self.max_tokens = []
         self.closed = []
 
     def stream_generate(
@@ -74,6 +76,7 @@ class DummyContainer:
         label=None,
     ):
         self.request_ids.append(request_id)
+        self.max_tokens.append(_params.max_tokens)
         chunks = self.attempts[len(self.request_ids) - 1]
         closed = self.closed
 
@@ -137,8 +140,34 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             container.request_ids, ["request-1", "request-1-toolretry1"]
         )
+        self.assertEqual(
+            container.max_tokens, [None, chat_completion.TOOL_CALL_RETRY_MAX_TOKENS]
+        )
         self.assertEqual(container.closed, container.request_ids)
         self.assertEqual(disconnect.polls, 1)
+
+    async def test_retry_preserves_smaller_client_token_limit(self):
+        container = DummyContainer([[terminal(MALFORMED)], [terminal(VALID)]])
+        queue = asyncio.Queue()
+        disconnect = DummyDisconnectHandler()
+        with (
+            patch.object(chat_completion.model, "container", container),
+            patch.object(chat_completion.zeta_metrics, "request_started"),
+            patch.object(chat_completion.zeta_metrics, "observe_generation"),
+            patch.object(chat_completion.zeta_metrics, "request_finished"),
+        ):
+            await chat_completion._chat_stream_collector(
+                0,
+                queue,
+                "request-1",
+                "prompt",
+                request_with_tool(max_tokens=512),
+                False,
+                streaming_mode=True,
+                disconnect_handler=disconnect,
+            )
+
+        self.assertEqual(container.max_tokens, [512, 512])
 
     async def test_stream_retries_before_false_terminal_is_emitted(self):
         container = DummyContainer([[terminal(MALFORMED)], [terminal(VALID)]])
