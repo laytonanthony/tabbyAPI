@@ -44,11 +44,12 @@ from endpoints.OAI.utils.stream_parser import (
 from endpoints.OAI.utils.tools import (
     ToolCallParseError,
     get_toolcall_tags,
+    is_zeta_search_glm_intent,
+    is_zeta_search_pseudo_intent,
     parse_toolcalls,
     parse_zeta_search_pseudo_toolcall,
 )
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_usage_stats
-
 
 # A malformed model-emitted tool block is safe to retry because no tool has
 # executed yet. Keep this bounded: repeated malformed output must surface as
@@ -59,6 +60,11 @@ TOOL_CALL_PARSE_RETRIES = 1
 # max_tokens unset inherits the full remaining context window, which can keep a
 # buffered retry silent for many minutes and trip downstream SSE idle timers.
 TOOL_CALL_RETRY_MAX_TOKENS = 4096
+
+ZETA_SEARCH_FAILURE_MESSAGE = (
+    "I couldn't execute the web search tool, so I have no verified search "
+    "results. Please retry the search."
+)
 
 
 def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
@@ -115,7 +121,9 @@ def _user_suffix_len(data: ChatCompletionRequest) -> int:
                 len(part.text) for part in content if part.type == "text" and part.text
             )
 
-    if data.response_prefix and (data.add_generation_prompt or data.continue_final_message):
+    if data.response_prefix and (
+        data.add_generation_prompt or data.continue_final_message
+    ):
         suffix_len += len(data.response_prefix)
 
     return suffix_len
@@ -295,7 +303,9 @@ def _sort_tool_messages(message_dicts: List[dict]):
         if msg.get("role") != "assistant" or not msg.get("tool_calls"):
             continue
 
-        order = {tc["id"]: idx for idx, tc in enumerate(msg["tool_calls"]) if tc.get("id")}
+        order = {
+            tc["id"]: idx for idx, tc in enumerate(msg["tool_calls"]) if tc.get("id")
+        }
         run_start = i
         while i < len(message_dicts) and message_dicts[i].get("role") == "tool":
             i += 1
@@ -385,10 +395,14 @@ def _mark_continued_final_message(data: ChatCompletionRequest) -> str:
         return HTTPException(422, error_message)
 
     if data.add_generation_prompt:
-        raise request_error("continue_final_message requires add_generation_prompt to be false")
+        raise request_error(
+            "continue_final_message requires add_generation_prompt to be false"
+        )
 
     if not data.messages:
-        raise request_error("continue_final_message is set but there are no messages to continue")
+        raise request_error(
+            "continue_final_message is set but there are no messages to continue"
+        )
 
     final_message = data.messages[-1].model_copy(deep=True)
 
@@ -433,7 +447,10 @@ def _cut_prompt_at_continue_tag(prompt: str, final_message_text: str) -> str:
 
     tag_loc = prompt.rindex(bare_tag)
 
-    if prompt[tag_loc : tag_loc + len(CONTINUE_FINAL_MESSAGE_TAG)] == CONTINUE_FINAL_MESSAGE_TAG:
+    if (
+        prompt[tag_loc : tag_loc + len(CONTINUE_FINAL_MESSAGE_TAG)]
+        == CONTINUE_FINAL_MESSAGE_TAG
+    ):
         # The template preserves trailing whitespace in message content.
         return prompt[:tag_loc]
 
@@ -541,7 +558,11 @@ async def apply_chat_template(data: ChatCompletionRequest):
         # Removes the starting BOS token if the model adds one
         # This is to prevent add_bos_token from adding multiple bos tokens
         bos_token = template_vars.get("bos_token")
-        if bos_token and model.container.hf_model.add_bos_token() and prompt.startswith(bos_token):
+        if (
+            bos_token
+            and model.container.hf_model.add_bos_token()
+            and prompt.startswith(bos_token)
+        ):
             prompt = prompt.removeprefix(bos_token)
 
         return prompt, mm_embeddings
@@ -600,6 +621,10 @@ def _parse_zeta_search_pseudo_tool_calls(
     """Validate and serialize a narrowly recoverable Zeta search pseudo-call."""
 
     parsed = parse_zeta_search_pseudo_toolcall(text, tool_specs) or []
+    if not parsed and is_zeta_search_pseudo_intent(text, tool_specs):
+        raise ToolCallParseError(
+            "incomplete Zeta search pseudo-call produced no tool call"
+        )
     for tc_idx, item in enumerate(parsed):
         item.index = tc_idx
     dumped = [item.model_dump(mode="json") for item in parsed]
@@ -656,13 +681,14 @@ def _should_buffer_zeta_search_pseudo_call(params: ChatCompletionRequest) -> boo
     return params.tool_choice != "none" and bool(
         params.tools
         and any(
-            spec.function.name == "zeta_search__web_search"
-            for spec in params.tools
+            spec.function.name == "zeta_search__web_search" for spec in params.tools
         )
     )
 
 
-def _resolve_reasoning_budget(data: ChatCompletionRequest, mc) -> tuple[Optional[int], str]:
+def _resolve_reasoning_budget(
+    data: ChatCompletionRequest, mc
+) -> tuple[Optional[int], str]:
     """
     Resolve the reasoning token budget and forced message from the request and
     model config. Following llama.cpp, a negative budget at any level means
@@ -761,6 +787,7 @@ async def _chat_stream_collector(
     reasoning_tokens = 0
     zeta_metrics.request_started(request_id, mc.model_dir.name)
     visible_content_emitted = False
+    malformed_zeta_search_intent = False
 
     try:
         for attempt in range(TOOL_CALL_PARSE_RETRIES + 1):
@@ -887,10 +914,7 @@ async def _chat_stream_collector(
                         promoted_pseudo_call = False
                         if finish_reason and (
                             full_tool
-                            or (
-                                full_content
-                                and attempt_params.tool_choice != "none"
-                            )
+                            or (full_content and attempt_params.tool_choice != "none")
                         ):
                             try:
                                 if full_tool:
@@ -910,6 +934,21 @@ async def _chat_stream_collector(
                                     )
                                     promoted_pseudo_call = bool(parsed_tool_calls)
                             except ToolCallParseError as exc:
+                                if (
+                                    full_tool
+                                    and is_zeta_search_glm_intent(
+                                        full_tool,
+                                        tool_format,
+                                        attempt_params.tools,
+                                    )
+                                ) or (
+                                    not full_tool
+                                    and is_zeta_search_pseudo_intent(
+                                        full_content,
+                                        attempt_params.tools,
+                                    )
+                                ):
+                                    malformed_zeta_search_intent = True
                                 # Retry inside this request even if commentary
                                 # or content has already reached the client.
                                 # Letting the exception escape after HTTP 200
@@ -978,9 +1017,7 @@ async def _chat_stream_collector(
             if streaming_mode and buffer_retry:
                 parsed_tool_calls = []
                 retry_parse_error = None
-                if full_tool or (
-                    full_content and attempt_params.tool_choice != "none"
-                ):
+                if full_tool or (full_content and attempt_params.tool_choice != "none"):
                     try:
                         if full_tool:
                             parsed_tool_calls = _parse_tool_calls(
@@ -990,15 +1027,42 @@ async def _chat_stream_collector(
                                 attempt_params.tools,
                             )
                         else:
-                            parsed_tool_calls = (
-                                _parse_zeta_search_pseudo_tool_calls(
-                                    full_content,
-                                    request_id,
-                                    attempt_params.tools,
-                                )
+                            parsed_tool_calls = _parse_zeta_search_pseudo_tool_calls(
+                                full_content,
+                                request_id,
+                                attempt_params.tools,
                             )
                     except ToolCallParseError as exc:
                         retry_parse_error = exc
+                        if (
+                            full_tool
+                            and is_zeta_search_glm_intent(
+                                full_tool,
+                                tool_format,
+                                attempt_params.tools,
+                            )
+                        ) or (
+                            not full_tool
+                            and is_zeta_search_pseudo_intent(
+                                full_content,
+                                attempt_params.tools,
+                            )
+                        ):
+                            malformed_zeta_search_intent = True
+
+                if (
+                    malformed_zeta_search_intent
+                    and parsed_tool_calls
+                    and (
+                        len(parsed_tool_calls) != 1
+                        or parsed_tool_calls[0].get("function", {}).get("name")
+                        != "zeta_search__web_search"
+                    )
+                ):
+                    retry_parse_error = ToolCallParseError(
+                        "search repair emitted a different tool"
+                    )
+                    parsed_tool_calls = []
 
                 # The retry is hidden while it runs. Prefer a validated call;
                 # if the model changes its mind and answers normally, append
@@ -1012,11 +1076,14 @@ async def _chat_stream_collector(
                     generation["finish_reason"] = "tool_calls"
                     await gen_queue.put(generation)
                 else:
-                    fallback_content = full_content
-                    if not fallback_content.strip() and not visible_content_emitted:
+                    if malformed_zeta_search_intent:
                         fallback_content = (
-                            "I couldn't complete the requested tool call. Please try again."
-                        )
+                            "\n\n" if visible_content_emitted else ""
+                        ) + ZETA_SEARCH_FAILURE_MESSAGE
+                    else:
+                        fallback_content = full_content
+                    if not fallback_content.strip() and not visible_content_emitted:
+                        fallback_content = "I couldn't complete the requested tool call. Please try again."
                     xlogger.warning(
                         "Tool-call retry completed without a validated call; "
                         "closing the stream normally",
@@ -1026,6 +1093,7 @@ async def _chat_stream_collector(
                             "error": str(retry_parse_error or "no tool call emitted"),
                             "visible_content_emitted": visible_content_emitted,
                             "fallback_content_emitted": bool(fallback_content),
+                            "zeta_search_failed_closed": malformed_zeta_search_intent,
                         },
                     )
                     generation["delta_reasoning_content"] = ""
@@ -1045,16 +1113,29 @@ async def _chat_stream_collector(
                             attempt_params.tools,
                         )
                     elif attempt_params.tool_choice != "none":
-                        parsed_tool_calls = (
-                            _parse_zeta_search_pseudo_tool_calls(
-                                full_content,
-                                request_id,
-                                attempt_params.tools,
-                            )
+                        parsed_tool_calls = _parse_zeta_search_pseudo_tool_calls(
+                            full_content,
+                            request_id,
+                            attempt_params.tools,
                         )
                     else:
                         parsed_tool_calls = []
                 except ToolCallParseError as exc:
+                    if (
+                        full_tool
+                        and is_zeta_search_glm_intent(
+                            full_tool,
+                            tool_format,
+                            attempt_params.tools,
+                        )
+                    ) or (
+                        not full_tool
+                        and is_zeta_search_pseudo_intent(
+                            full_content,
+                            attempt_params.tools,
+                        )
+                    ):
+                        malformed_zeta_search_intent = True
                     if attempt < TOOL_CALL_PARSE_RETRIES:
                         xlogger.warning(
                             "Malformed tool call; retrying generation once",
@@ -1067,7 +1148,27 @@ async def _chat_stream_collector(
                         if disconnect_handler is not None:
                             await disconnect_handler.poll()
                         continue
-                    raise
+                    if malformed_zeta_search_intent:
+                        parsed_tool_calls = []
+                    else:
+                        raise
+
+                if (
+                    malformed_zeta_search_intent
+                    and parsed_tool_calls
+                    and (
+                        len(parsed_tool_calls) != 1
+                        or parsed_tool_calls[0].get("function", {}).get("name")
+                        != "zeta_search__web_search"
+                    )
+                ):
+                    parsed_tool_calls = []
+
+                if malformed_zeta_search_intent and not parsed_tool_calls:
+                    full_content = ZETA_SEARCH_FAILURE_MESSAGE
+                    full_reasoning = ""
+                    collected_logprobs = []
+                    generation.pop("logprob_response", None)
 
                 has_content = bool(full_content.strip())
                 if has_content and collected_logprobs:
@@ -1172,12 +1273,14 @@ async def stream_generate_chat_completion(
                 if return_usage:
                     usage_stats_list.append(get_usage_stats(generation))
                     if remaining_n == 0:
-                        usage_chunk, usage_chunk_dict = _compose_serialize_stream_usage_chunk(
-                            request.state.id,
-                            aggregate_usage_stats(usage_stats_list),
-                            generation["index"],
-                            finish_reason,
-                            model_path.name,
+                        usage_chunk, usage_chunk_dict = (
+                            _compose_serialize_stream_usage_chunk(
+                                request.state.id,
+                                aggregate_usage_stats(usage_stats_list),
+                                generation["index"],
+                                finish_reason,
+                                model_path.name,
+                            )
                         )
                         yield usage_chunk
                         xlogger.debug(
@@ -1199,7 +1302,9 @@ async def stream_generate_chat_completion(
 
     except Exception as e:
         xlogger.error("Error during chat completion", str(e), details=f"\n{str(e)}")
-        yield get_generator_error("Chat completion aborted. Please check the server console.")
+        yield get_generator_error(
+            "Chat completion aborted. Please check the server console."
+        )
 
     finally:
         for task in gen_tasks:
@@ -1267,9 +1372,13 @@ async def generate_chat_completion(
             if isinstance(r, Exception):
                 raise r
             generations.append(r)
-        response = _compose_response(request.state.id, generations, model_path.name, return_usage)
+        response = _compose_response(
+            request.state.id, generations, model_path.name, return_usage
+        )
 
-        xlogger.debug(f"{request_tag(request)} chat completion finished", {"response": response})
+        xlogger.debug(
+            f"{request_tag(request)} chat completion finished", {"response": response}
+        )
         return response
 
     except CancelledError:

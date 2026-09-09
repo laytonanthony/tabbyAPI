@@ -30,11 +30,27 @@ TOOLCALL_END = "</tool_call>"
 
 _OUTER = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _FUNC_NAME = re.compile(r"^(.*?)(?=<arg_key>|$)", re.DOTALL)
-_ARG_TOKEN = re.compile(r"<arg_(key|value)>(.*?)</arg_\1>", re.DOTALL)
+_ARG_PAIR = re.compile(
+    r"\s*<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    re.DOTALL,
+)
 
 
 def parse_toolcalls(text: str) -> list[ToolCall]:
     outer_matches = list(_OUTER.finditer(text))
+
+    # A tool batch is atomic. Never accept a valid prefix while silently
+    # ignoring prose, an empty/nested block, or a malformed trailing call.
+    # Only whitespace may appear between complete top-level envelopes.
+    position = 0
+    for match in outer_matches:
+        if text[position : match.start()].strip():
+            raise ValueError("unexpected text outside GLM tool-call envelope")
+        if TOOLCALL_START in match.group(1) or TOOLCALL_END in match.group(1):
+            raise ValueError("nested GLM tool-call envelope")
+        position = match.end()
+    if text[position:].strip():
+        raise ValueError("incomplete or trailing GLM tool-call envelope")
 
     results = []
     for om in outer_matches:
@@ -43,35 +59,42 @@ def parse_toolcalls(text: str) -> list[ToolCall]:
         # Extract function name: everything before the first <arg_key>
         name_match = _FUNC_NAME.match(inner)
         if not name_match:
-            continue
+            raise ValueError("missing GLM function name")
         func_name = name_match.group(1).strip()
         if not func_name:
-            continue
+            raise ValueError("blank GLM function name")
 
-        # Preserve the emitted order. Extracting keys and values separately
-        # can shift later values onto the wrong keys when one tag is missing.
-        # Reject the entire call instead of risking a partially reconstructed
-        # command with different semantics.
-        tokens = [(m.group(1), m.group(2)) for m in _ARG_TOKEN.finditer(inner)]
-        key_markers = inner.count("<arg_key>")
-        value_markers = inner.count("<arg_value>")
-        if key_markers != value_markers or len(tokens) != key_markers + value_markers:
-            raise ValueError("unmatched GLM argument key/value tag")
-        if len(tokens) % 2:
-            raise ValueError("incomplete GLM argument key/value pair")
-
+        # Parse a contiguous sequence of complete key/value pairs. Searching
+        # for tags independently can silently ignore junk or shift a later
+        # value onto the wrong key, changing the call's meaning.
         args: dict[str, any] = {}
-        for index in range(0, len(tokens), 2):
-            key_type, raw_key = tokens[index]
-            value_type, raw_value = tokens[index + 1]
-            if key_type != "key" or value_type != "value":
-                raise ValueError("misordered GLM argument key/value pair")
+        position = name_match.end()
+        pair_count = 0
+        while position < len(inner):
+            if not inner[position:].strip():
+                position = len(inner)
+                break
+            pair = _ARG_PAIR.match(inner, position)
+            if pair is None:
+                raise ValueError("incomplete or trailing GLM argument markup")
+            raw_key, raw_value = pair.groups()
             key = raw_key.strip()
             if not key:
                 raise ValueError("blank GLM argument key")
             if key in args:
                 raise ValueError(f"duplicate GLM argument key {key!r}")
             args[key] = coerce_param_value(raw_value)
+            position = pair.end()
+            pair_count += 1
+
+        marker_counts = {
+            inner.count("<arg_key>"),
+            inner.count("</arg_key>"),
+            inner.count("<arg_value>"),
+            inner.count("</arg_value>"),
+        }
+        if marker_counts != {pair_count}:
+            raise ValueError("unmatched GLM argument key/value tag")
 
         args_json = json.dumps(args, ensure_ascii=False)
         results.append(ToolCall(function=Tool(name=func_name, arguments=args_json)))

@@ -8,16 +8,29 @@ from endpoints.OAI.types.chat_completion import ChatCompletionRequest
 from endpoints.OAI.types.tools import Function, ToolSpec
 from endpoints.OAI.utils import chat_completion
 
-
 MALFORMED = "<tool_call>run<arg_key>cmd</arg_key></tool_call>"
 VALID = (
-    "<tool_call>run"
-    "<arg_key>cmd</arg_key><arg_value>dir</arg_value>"
-    "</tool_call>"
+    "<tool_call>run" "<arg_key>cmd</arg_key><arg_value>dir</arg_value>" "</tool_call>"
 )
+UNCLOSED_SEARCH = (
+    "<tool_call>zeta_search__web_search"
+    "<arg_key>query</arg_key><arg_value>GPU Spain</arg_value>"
+    "<arg_key>count</arg_key><arg_value>8</arg_value>"
+)
+MALFORMED_SEARCH = (
+    "<tool_call>zeta_search__web_search" "<arg_key>query</arg_key><arg_value>GPU Spain"
+)
+VALID_SEARCH = UNCLOSED_SEARCH + "</tool_call>"
 PSEUDO_SEARCH = (
     "On it — searching now.\n\n"
     'To: zeta_search/web_search\n{"query":"GPU Spain","num_results":8}'
+)
+MALFORMED_PSEUDO_SEARCH = (
+    "On it — searching now.\n\n"
+    'To: zeta_search/web_search\n{"query":"GPU Spain","count":99}'
+)
+TRUNCATED_PSEUDO_SEARCH = (
+    "On it — searching now.\n\n" 'To: zeta_search/web_search\n{"query":"GPU Spain"'
 )
 
 
@@ -57,8 +70,12 @@ def request_with_search_tool(tool_choice="auto"):
                     parameters={
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string"},
-                            "count": {"type": "integer"},
+                            "query": {"type": "string", "minLength": 1},
+                            "count": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                            },
                         },
                         "required": ["query"],
                         "additionalProperties": False,
@@ -134,7 +151,7 @@ def terminal(text, finish_reason="stop"):
 
 
 class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
-    async def collect(self, container, *, streaming):
+    async def collect(self, container, *, streaming, request=None):
         queue = asyncio.Queue() if streaming else None
         disconnect = DummyDisconnectHandler()
         with (
@@ -148,7 +165,7 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
                 queue,
                 "request-1",
                 "prompt",
-                request_with_tool(),
+                request or request_with_tool(),
                 False,
                 streaming_mode=streaming,
                 disconnect_handler=disconnect,
@@ -167,9 +184,7 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued, [])
         self.assertEqual(result["finish_reason"], "tool_calls")
         self.assertEqual(result["tool_calls"][0]["function"]["name"], "run")
-        self.assertEqual(
-            container.request_ids, ["request-1", "request-1-toolretry1"]
-        )
+        self.assertEqual(container.request_ids, ["request-1", "request-1-toolretry1"])
         self.assertEqual(
             container.max_tokens, [None, chat_completion.TOOL_CALL_RETRY_MAX_TOKENS]
         )
@@ -208,9 +223,7 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIsInstance(queued[0], Exception)
         self.assertEqual(queued[0]["finish_reason"], "tool_calls")
         self.assertEqual(queued[0]["delta_tool_calls"][0]["function"]["name"], "run")
-        self.assertEqual(
-            container.request_ids, ["request-1", "request-1-toolretry1"]
-        )
+        self.assertEqual(container.request_ids, ["request-1", "request-1-toolretry1"])
         self.assertEqual(container.closed, container.request_ids)
         self.assertEqual(disconnect.polls, 1)
 
@@ -234,15 +247,11 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
         )
         _result, queued, _disconnect = await self.collect(container, streaming=True)
 
-        self.assertEqual(
-            container.request_ids, ["request-1", "request-1-toolretry1"]
-        )
+        self.assertEqual(container.request_ids, ["request-1", "request-1-toolretry1"])
         self.assertEqual(queued[0]["delta_content"], "answer in progress")
         self.assertFalse(any(isinstance(item, Exception) for item in queued))
         self.assertEqual(queued[-1]["finish_reason"], "tool_calls")
-        self.assertEqual(
-            queued[-1]["delta_tool_calls"][0]["function"]["name"], "run"
-        )
+        self.assertEqual(queued[-1]["delta_tool_calls"][0]["function"]["name"], "run")
         self.assertEqual(container.closed, container.request_ids)
 
     async def test_retry_that_abandons_tool_call_closes_stream_normally(self):
@@ -255,6 +264,205 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIsInstance(queued[0], Exception)
         self.assertEqual(queued[0]["delta_content"], "unrelated answer")
         self.assertEqual(queued[0]["finish_reason"], "stop")
+
+    async def test_stream_recovers_unclosed_zeta_search_without_retry(self):
+        container = DummyContainer([[terminal(UNCLOSED_SEARCH)]])
+
+        _result, queued, disconnect = await self.collect(
+            container,
+            streaming=True,
+            request=request_with_search_tool(),
+        )
+
+        self.assertEqual(container.request_ids, ["request-1"])
+        self.assertEqual(disconnect.polls, 0)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["finish_reason"], "tool_calls")
+        call = queued[0]["delta_tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "zeta_search__web_search")
+        self.assertEqual(
+            json.loads(call["function"]["arguments"]),
+            {"query": "GPU Spain", "count": 8},
+        )
+
+    async def test_stream_malformed_zeta_retry_prose_fails_closed(self):
+        fabricated = "I found a verified GPU for EUR 4,700."
+        container = DummyContainer(
+            [[terminal(MALFORMED_SEARCH)], [terminal(fabricated)]]
+        )
+
+        _result, queued, _disconnect = await self.collect(
+            container,
+            streaming=True,
+            request=request_with_search_tool(),
+        )
+
+        self.assertEqual(len(container.request_ids), 2)
+        self.assertEqual(len(queued), 1)
+        self.assertNotIn(fabricated, queued[0]["delta_content"])
+        self.assertEqual(
+            queued[0]["delta_content"],
+            chat_completion.ZETA_SEARCH_FAILURE_MESSAGE,
+        )
+        self.assertEqual(queued[0]["finish_reason"], "stop")
+
+    async def test_nonstream_malformed_zeta_retry_prose_fails_closed(self):
+        fabricated = "I found a verified GPU for EUR 4,700."
+        container = DummyContainer(
+            [[terminal(MALFORMED_SEARCH)], [terminal(fabricated)]]
+        )
+
+        result, queued, _disconnect = await self.collect(
+            container,
+            streaming=False,
+            request=request_with_search_tool(),
+        )
+
+        self.assertEqual(queued, [])
+        self.assertEqual(result["content"], chat_completion.ZETA_SEARCH_FAILURE_MESSAGE)
+        self.assertEqual(result["tool_calls"], [])
+        self.assertEqual(result["finish_reason"], "stop")
+
+    async def test_nonstream_fail_closed_discards_retry_reasoning(self):
+        fabricated = "I found a verified GPU for EUR 4,700."
+        container = DummyContainer(
+            [
+                [terminal(MALFORMED_SEARCH)],
+                [terminal(f"<think>Unverified EUR 4,700</think>{fabricated}")],
+            ]
+        )
+        container.reasoning = True
+        container.reasoning_start_token = "<think>"
+        container.reasoning_end_token = "</think>"
+
+        result, queued, _disconnect = await self.collect(
+            container,
+            streaming=False,
+            request=request_with_search_tool(),
+        )
+
+        self.assertEqual(queued, [])
+        self.assertEqual(result["content"], chat_completion.ZETA_SEARCH_FAILURE_MESSAGE)
+        self.assertEqual(result["reasoning_content"], "")
+        self.assertNotIn("logprob_response", result)
+
+    async def test_malformed_zeta_pseudo_call_retry_prose_fails_closed(self):
+        fabricated = "The search returned a GPU for EUR 4,700."
+        container = DummyContainer(
+            [[terminal(MALFORMED_PSEUDO_SEARCH)], [terminal(fabricated)]]
+        )
+
+        _result, queued, _disconnect = await self.collect(
+            container,
+            streaming=True,
+            request=request_with_search_tool(),
+        )
+
+        rendered = "".join(item.get("delta_content", "") for item in queued)
+        self.assertNotIn(fabricated, rendered)
+        self.assertIn(chat_completion.ZETA_SEARCH_FAILURE_MESSAGE, rendered)
+        self.assertEqual(queued[-1]["finish_reason"], "stop")
+
+    async def test_truncated_zeta_pseudo_call_retry_prose_fails_closed(self):
+        fabricated = "A Spanish retailer has it for EUR 4,700."
+        container = DummyContainer(
+            [[terminal(TRUNCATED_PSEUDO_SEARCH)], [terminal(fabricated)]]
+        )
+
+        _result, queued, _disconnect = await self.collect(
+            container,
+            streaming=True,
+            request=request_with_search_tool(),
+        )
+
+        rendered = "".join(item.get("delta_content", "") for item in queued)
+        self.assertEqual(len(container.request_ids), 2)
+        self.assertNotIn(fabricated, rendered)
+        self.assertNotIn("To: zeta_search/web_search", rendered)
+        self.assertIn(chat_completion.ZETA_SEARCH_FAILURE_MESSAGE, rendered)
+        self.assertEqual(queued[-1]["finish_reason"], "stop")
+
+    async def test_nonstream_truncated_zeta_pseudo_call_fails_closed(self):
+        fabricated = "A Spanish retailer has it for EUR 4,700."
+        container = DummyContainer(
+            [[terminal(TRUNCATED_PSEUDO_SEARCH)], [terminal(fabricated)]]
+        )
+
+        result, queued, _disconnect = await self.collect(
+            container,
+            streaming=False,
+            request=request_with_search_tool(),
+        )
+
+        self.assertEqual(queued, [])
+        self.assertEqual(len(container.request_ids), 2)
+        self.assertEqual(result["content"], chat_completion.ZETA_SEARCH_FAILURE_MESSAGE)
+        self.assertEqual(result["tool_calls"], [])
+        self.assertEqual(result["finish_reason"], "stop")
+
+    async def test_malformed_zeta_search_accepts_valid_search_retry(self):
+        container = DummyContainer(
+            [[terminal(MALFORMED_SEARCH)], [terminal(VALID_SEARCH)]]
+        )
+
+        _result, queued, _disconnect = await self.collect(
+            container,
+            streaming=True,
+            request=request_with_search_tool(),
+        )
+
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["finish_reason"], "tool_calls")
+        self.assertEqual(
+            queued[0]["delta_tool_calls"][0]["function"]["name"],
+            "zeta_search__web_search",
+        )
+
+    async def test_malformed_zeta_search_never_cross_recovers_another_tool(self):
+        request = request_with_search_tool()
+        request.tools.append(request_with_tool().tools[0])
+        container = DummyContainer([[terminal(MALFORMED_SEARCH)], [terminal(VALID)]])
+
+        _result, queued, _disconnect = await self.collect(
+            container,
+            streaming=True,
+            request=request,
+        )
+
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["delta_tool_calls"], [])
+        self.assertEqual(
+            queued[0]["delta_content"],
+            chat_completion.ZETA_SEARCH_FAILURE_MESSAGE,
+        )
+        self.assertEqual(queued[0]["finish_reason"], "stop")
+
+    async def test_zeta_as_second_malformed_call_still_fails_closed(self):
+        request = request_with_search_tool()
+        request.tools.append(request_with_tool().tools[0])
+        valid_other = VALID
+        fabricated = "The search returned a workstation for EUR 4,700."
+        container = DummyContainer(
+            [
+                [terminal(valid_other + MALFORMED_SEARCH)],
+                [terminal(fabricated)],
+            ]
+        )
+
+        _result, queued, _disconnect = await self.collect(
+            container,
+            streaming=True,
+            request=request,
+        )
+
+        self.assertEqual(len(container.request_ids), 2)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["delta_tool_calls"], [])
+        self.assertNotIn(fabricated, queued[0]["delta_content"])
+        self.assertEqual(
+            queued[0]["delta_content"],
+            chat_completion.ZETA_SEARCH_FAILURE_MESSAGE,
+        )
 
     async def test_repeated_malformed_output_after_content_closes_normally(self):
         container = DummyContainer(
@@ -347,7 +555,12 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_buffer_preserves_non_candidate_content(self):
         original = "Send this\nTo: Anthony\nwhen you are ready."
         container = DummyContainer(
-            [[terminal("Send this\nTo:", None), terminal(" Anthony\nwhen you are ready.")]]
+            [
+                [
+                    terminal("Send this\nTo:", None),
+                    terminal(" Anthony\nwhen you are ready."),
+                ]
+            ]
         )
         queue = asyncio.Queue()
         with (

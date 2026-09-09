@@ -54,9 +54,11 @@ class ToolCallParseError(ValueError):
 
 
 _ZETA_SEARCH_PSEUDO_CALL = re.compile(
-    r"(?:^|\n)To:[ \t]*(zeta_search/web_search)[ \t]*\n"
-    r"([ \t]*\{.*\})[ \t]*\Z",
+    r"(?:^|\n)To:[ \t]*(zeta_search/web_search)[ \t]*\n" r"([ \t]*\{.*\})[ \t]*\Z",
     re.DOTALL,
+)
+_ZETA_SEARCH_PSEUDO_INTENT = re.compile(
+    r"(?:^|\n)To:[ \t]*zeta_search/web_search[ \t]*(?:\n|\Z)"
 )
 _ZETA_SEARCH_ACTION_PREAMBLE = re.compile(
     r"\b(search(?:ing)?|look(?:ing)?[ \t]+up|buscar|buscando|b[uú]squeda)\b",
@@ -66,8 +68,26 @@ _ZETA_SEARCH_EXAMPLE_PREAMBLE = re.compile(
     r"\b(example|sample|illustration|format|syntax|quote|ejemplo)\b",
     re.IGNORECASE,
 )
+_ZETA_SEARCH_NEGATED_PREAMBLE = re.compile(
+    r"\b(?:do[ \t]+not|don't|never|cannot|can't|won't)[ \t]+"
+    r"(?:search|look[ \t]+up)\b|\bno[ \t]+buscar\b",
+    re.IGNORECASE,
+)
 _ZETA_SEARCH_FUNCTION = "zeta_search__web_search"
+_ZETA_SEARCH_RECIPIENTS = {
+    _ZETA_SEARCH_FUNCTION,
+    "zeta_search/web_search",
+}
+_ZETA_SEARCH_GLM_INTENT = re.compile(
+    r"<tool_call>\s*(?:zeta_search__web_search|zeta_search/web_search)"
+    r"(?=\s*(?:<|\Z))"
+)
 _ZETA_SEARCH_PREAMBLE_MAX_CHARS = 512
+_ZETA_SEARCH_QUERY_MAX_CHARS = 2048
+_GLM_ARGUMENT_PAIR = re.compile(
+    r"\s*<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    re.DOTALL,
+)
 
 
 def _json_object_without_duplicate_keys(raw: str, description: str) -> dict:
@@ -75,14 +95,21 @@ def _json_object_without_duplicate_keys(raw: str, description: str) -> dict:
         value = {}
         for key, item in pairs:
             if key in value:
-                raise ToolCallParseError(
-                    f"{description} repeats argument {key!r}"
-                )
+                raise ToolCallParseError(f"{description} repeats argument {key!r}")
             value[key] = item
         return value
 
+    def reject_nonstandard_constant(value):
+        raise ToolCallParseError(
+            f"{description} contains unsupported JSON constant {value!r}"
+        )
+
     try:
-        value = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+        value = json.loads(
+            raw,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonstandard_constant,
+        )
     except ToolCallParseError:
         raise
     except (TypeError, json.JSONDecodeError) as exc:
@@ -90,6 +117,23 @@ def _json_object_without_duplicate_keys(raw: str, description: str) -> dict:
     if not isinstance(value, dict):
         raise ToolCallParseError(f"{description} arguments must be a JSON object")
     return value
+
+
+def _has_zeta_search_tool_name(
+    tool_specs: Optional[Sequence[ToolSpec]],
+) -> bool:
+    return any(
+        spec.function.name == _ZETA_SEARCH_FUNCTION for spec in (tool_specs or [])
+    )
+
+
+def _has_actionable_zeta_search_preamble(preamble: str) -> bool:
+    return not preamble or (
+        len(preamble) <= _ZETA_SEARCH_PREAMBLE_MAX_CHARS
+        and bool(_ZETA_SEARCH_ACTION_PREAMBLE.search(preamble))
+        and not _ZETA_SEARCH_EXAMPLE_PREAMBLE.search(preamble)
+        and not _ZETA_SEARCH_NEGATED_PREAMBLE.search(preamble)
+    )
 
 
 def _validate_pseudo_argument_types(
@@ -107,11 +151,15 @@ def _validate_pseudo_argument_types(
             continue
         expected = argument_schema.get("type")
         if expected == "string" and not isinstance(value, str):
-            raise ToolCallParseError(f"{description} argument {name!r} must be a string")
+            raise ToolCallParseError(
+                f"{description} argument {name!r} must be a string"
+            )
         if expected == "integer" and (
             not isinstance(value, int) or isinstance(value, bool)
         ):
-            raise ToolCallParseError(f"{description} argument {name!r} must be an integer")
+            raise ToolCallParseError(
+                f"{description} argument {name!r} must be an integer"
+            )
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             minimum = argument_schema.get("minimum")
             maximum = argument_schema.get("maximum")
@@ -123,6 +171,229 @@ def _validate_pseudo_argument_types(
                 raise ToolCallParseError(
                     f"{description} argument {name!r} exceeds its maximum"
                 )
+
+
+def _unique_zeta_search_spec(
+    tool_specs: Optional[Sequence[ToolSpec]],
+    description: str,
+) -> ToolSpec:
+    """Return the one trusted Zeta search contract supplied with the request."""
+
+    matching_specs = [
+        spec
+        for spec in (tool_specs or [])
+        if spec.function.name == _ZETA_SEARCH_FUNCTION
+    ]
+    if len(matching_specs) != 1:
+        raise ToolCallParseError(
+            f"{description} is not backed by one unique Zeta search tool"
+        )
+
+    spec = matching_specs[0]
+    schema = spec.function.parameters
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    required = schema.get("required") if isinstance(schema, dict) else None
+    query_schema = properties.get("query") if isinstance(properties, dict) else None
+    count_schema = properties.get("count") if isinstance(properties, dict) else None
+
+    # The flattened function name alone is caller-controlled. Require the
+    # exact, read-only search contract that Zeta's MCP server advertises before
+    # promoting model text into an executable call.
+    if (
+        not isinstance(schema, dict)
+        or schema.get("type") != "object"
+        or not isinstance(properties, dict)
+        or set(properties) != {"query", "count"}
+        or required != ["query"]
+        or schema.get("additionalProperties") is not False
+        or not isinstance(query_schema, dict)
+        or query_schema.get("type") != "string"
+        or query_schema.get("minLength") != 1
+        or not isinstance(count_schema, dict)
+        or count_schema.get("type") != "integer"
+        or count_schema.get("minimum") != 1
+        or count_schema.get("maximum") != 10
+    ):
+        raise ToolCallParseError(
+            f"{description} is not backed by the canonical Zeta search schema"
+        )
+    return spec
+
+
+def _normalize_zeta_search_arguments(
+    arguments: dict,
+    schema: dict,
+    description: str,
+) -> dict:
+    """Normalize the one observed alias and enforce search-specific limits."""
+
+    arguments = dict(arguments)
+    if "num_results" in arguments:
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if "count" in arguments:
+            raise ToolCallParseError(
+                f"{description} supplies both 'count' and 'num_results'"
+            )
+        if not isinstance(properties, dict) or "count" not in properties:
+            raise ToolCallParseError(
+                f"{description} cannot map 'num_results' without a 'count' schema"
+            )
+        if "num_results" in properties:
+            raise ToolCallParseError(
+                f"{description} has an ambiguous 'num_results' schema"
+            )
+        arguments["count"] = arguments.pop("num_results")
+
+    _validate_pseudo_argument_types(arguments, schema, description)
+    query = arguments.get("query")
+    if (
+        not isinstance(query, str)
+        or not query.strip()
+        or len(query) > _ZETA_SEARCH_QUERY_MAX_CHARS
+    ):
+        raise ToolCallParseError(
+            f"{description} requires a nonblank query of at most "
+            f"{_ZETA_SEARCH_QUERY_MAX_CHARS} characters"
+        )
+    return arguments
+
+
+def _normalize_native_zeta_search_call(
+    parsed: Sequence[ToolCall],
+    tool_format: str,
+    tool_specs: Optional[Sequence[ToolSpec]],
+) -> None:
+    """Canonicalize and fully validate native Zeta search calls in place."""
+
+    if tool_format != "glm4_5":
+        return
+
+    zeta_calls = [
+        call for call in parsed if call.function.name in _ZETA_SEARCH_RECIPIENTS
+    ]
+    if not zeta_calls:
+        return
+
+    spec = _unique_zeta_search_spec(tool_specs, "native Zeta search call")
+    for call in zeta_calls:
+        recipient = call.function.name
+        description = f"native tool call {recipient!r}"
+        arguments = _json_object_without_duplicate_keys(
+            call.function.arguments,
+            description,
+        )
+        arguments = _normalize_zeta_search_arguments(
+            arguments,
+            spec.function.parameters,
+            description,
+        )
+        call.function.name = _ZETA_SEARCH_FUNCTION
+        call.function.arguments = json.dumps(arguments, ensure_ascii=False)
+
+
+def is_zeta_search_glm_intent(
+    text: str,
+    tool_format: str,
+    tool_specs: Optional[Sequence[ToolSpec]],
+) -> bool:
+    """Identify an attempted native Zeta search call without trusting its args."""
+
+    if tool_format != "glm4_5" or not isinstance(text, str):
+        return False
+    if not _has_zeta_search_tool_name(tool_specs):
+        return False
+
+    return bool(_ZETA_SEARCH_GLM_INTENT.search(text.strip()))
+
+
+def is_zeta_search_pseudo_intent(
+    text: str,
+    tool_specs: Optional[Sequence[ToolSpec]],
+) -> bool:
+    """Identify the exact Codex-style Zeta recipient after a parse failure."""
+
+    if not isinstance(text, str):
+        return False
+    if not _has_zeta_search_tool_name(tool_specs):
+        return False
+    stripped = text.strip()
+    match = _ZETA_SEARCH_PSEUDO_INTENT.search(stripped)
+    if match is None:
+        return False
+    preamble = stripped[: match.start()].strip()
+    return _has_actionable_zeta_search_preamble(preamble)
+
+
+def parse_unclosed_zeta_search_glm_toolcall(
+    text: str,
+    tool_format: str,
+    tool_specs: Optional[Sequence[ToolSpec]],
+) -> Optional[List[ToolCall]]:
+    """Repair a Zeta search call whose only structural defect is its outer end.
+
+    This deliberately does not make the general GLM parser permissive. The
+    recovery is restricted to one known read-only tool, one missing outer
+    closing tag, fully balanced inner argument pairs, and the exact schema
+    supplied by Zeta's MCP bridge.
+    """
+
+    if tool_format != "glm4_5" or not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if (
+        stripped.count(glm4_5.TOOLCALL_START) != 1
+        or stripped.count(glm4_5.TOOLCALL_END) != 0
+        or not stripped.startswith(glm4_5.TOOLCALL_START)
+    ):
+        return None
+
+    inner = stripped[len(glm4_5.TOOLCALL_START) :]
+    first_argument = inner.find("<arg_key>")
+    if first_argument < 0:
+        return None
+    recipient = inner[:first_argument].strip()
+    if recipient not in _ZETA_SEARCH_RECIPIENTS:
+        return None
+
+    description = f"unclosed native tool call {recipient!r}"
+    _unique_zeta_search_spec(tool_specs, description)
+    remainder = inner[first_argument:]
+    position = 0
+    pair_count = 0
+    while position < len(remainder):
+        if not remainder[position:].strip():
+            position = len(remainder)
+            break
+        match = _GLM_ARGUMENT_PAIR.match(remainder, position)
+        if match is None:
+            raise ToolCallParseError(
+                f"{description} has incomplete or trailing argument markup"
+            )
+        position = match.end()
+        pair_count += 1
+    if pair_count == 0:
+        return None
+
+    canonical_inner = _ZETA_SEARCH_FUNCTION + remainder
+    repaired = glm4_5.TOOLCALL_START + canonical_inner + glm4_5.TOOLCALL_END
+    try:
+        parsed = glm4_5.parse_toolcalls(repaired)
+    except Exception as exc:
+        raise ToolCallParseError(str(exc)) from exc
+    if len(parsed) != 1:
+        raise ToolCallParseError(f"{description} did not produce exactly one tool call")
+
+    _normalize_native_zeta_search_call(parsed, tool_format, tool_specs)
+    _validate_toolcalls(parsed, tool_specs)
+    xlogger.warning(
+        "Recovered one unclosed native Zeta search tool call",
+        {
+            "tool_format": tool_format,
+            "function_name": _ZETA_SEARCH_FUNCTION,
+            "argument_count": pair_count,
+        },
+    )
+    return parsed
 
 
 def parse_zeta_search_pseudo_toolcall(
@@ -147,52 +418,22 @@ def parse_zeta_search_pseudo_toolcall(
 
     recipient, raw_arguments = match.groups()
     preamble = text.strip()[: match.start()].strip()
-    if preamble and (
-        len(preamble) > _ZETA_SEARCH_PREAMBLE_MAX_CHARS
-        or not _ZETA_SEARCH_ACTION_PREAMBLE.search(preamble)
-        or _ZETA_SEARCH_EXAMPLE_PREAMBLE.search(preamble)
-    ):
+    if not _has_actionable_zeta_search_preamble(preamble):
         return None
 
-    expected_name = _ZETA_SEARCH_FUNCTION
-    matching_specs = [
-        spec for spec in tool_specs if spec.function.name == expected_name
-    ]
-    if len(matching_specs) != 1:
-        raise ToolCallParseError(
-            f"pseudo tool recipient {recipient!r} is not uniquely available"
-        )
-
     description = f"pseudo tool call {recipient!r}"
+    spec = _unique_zeta_search_spec(tool_specs, description)
     arguments = _json_object_without_duplicate_keys(raw_arguments, description)
-    schema = matching_specs[0].function.parameters
-
-    # This is the one legacy spelling observed from GLM. Keep the alias local
-    # to Zeta web search and require the delivered schema to prove that
-    # ``count`` is the intended field before changing it.
-    if "num_results" in arguments:
-        properties = schema.get("properties") if isinstance(schema, dict) else None
-        if "count" in arguments:
-            raise ToolCallParseError(
-                f"{description} supplies both 'count' and 'num_results'"
-            )
-        if not isinstance(properties, dict) or "count" not in properties:
-            raise ToolCallParseError(
-                f"{description} cannot map 'num_results' without a 'count' schema"
-            )
-        if "num_results" in properties:
-            raise ToolCallParseError(
-                f"{description} has an ambiguous 'num_results' schema"
-            )
-        arguments["count"] = arguments.pop("num_results")
-
-    if isinstance(schema, dict):
-        _validate_pseudo_argument_types(arguments, schema, description)
+    arguments = _normalize_zeta_search_arguments(
+        arguments,
+        spec.function.parameters,
+        description,
+    )
 
     parsed = [
         ToolCall(
             function=Tool(
-                name=expected_name,
+                name=_ZETA_SEARCH_FUNCTION,
                 arguments=json.dumps(arguments, ensure_ascii=False),
             )
         )
@@ -266,7 +507,9 @@ def _validate_toolcalls(
         if specs_by_name is None:
             continue
         if name not in specs_by_name:
-            raise ToolCallParseError(f"tool call {index} names unknown function {name!r}")
+            raise ToolCallParseError(
+                f"tool call {index} names unknown function {name!r}"
+            )
 
         schema = specs_by_name[name]
         if not isinstance(schema, dict):
@@ -317,11 +560,28 @@ def parse_toolcalls(
         if not parser:
             raise ToolCallParseError(f"unknown tool format {tool_format!r}")
 
+        if parser is glm4_5:
+            starts = tool_calls_str.count(glm4_5.TOOLCALL_START)
+            ends = tool_calls_str.count(glm4_5.TOOLCALL_END)
+            if starts != ends:
+                recovered = parse_unclosed_zeta_search_glm_toolcall(
+                    tool_calls_str,
+                    tool_format,
+                    tool_specs,
+                )
+                if recovered:
+                    return recovered
+                raise ToolCallParseError(
+                    "unbalanced GLM tool-call envelope "
+                    f"({starts} opening tag(s), {ends} closing tag(s))"
+                )
+
         parsed = parser.parse_toolcalls(tool_calls_str)
         if not parsed:
             raise ToolCallParseError(
                 f"nonblank {tool_format!r} tool output produced no tool calls"
             )
+        _normalize_native_zeta_search_call(parsed, tool_format, tool_specs)
         _validate_toolcalls(parsed, tool_specs)
         return list(parsed)
 
