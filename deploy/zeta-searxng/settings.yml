@@ -1,0 +1,40 @@
+# Zeta's non-secret SearXNG deployment overlay.
+#
+# Set SEARXNG_SECRET in the service environment. Never add the live value here.
+# SearXNG merges engine entries by name when use_default_settings is enabled.
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Zeta Search"
+
+search:
+  safe_search: 0
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  limiter: false
+  image_proxy: false
+
+engines:
+  # Bing results observed from this host were unrelated to the supplied query
+  # and interleaved above relevant retailer results at equal SearXNG scores.
+  - name: bing
+    disabled: true
+
+  # Yahoo currently returns useful Spanish retailer and price-comparison pages.
+  - name: yahoo
+    disabled: false
+
+  # These defaults produced challenge traffic from this host. Keep them off
+  # until a controlled smoke test shows that they are usable again.
+  - name: google
+    disabled: true
+  - name: karmasearch
+    disabled: true
