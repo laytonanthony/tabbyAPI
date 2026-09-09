@@ -4,6 +4,7 @@ import asyncio
 import json
 import pathlib
 from asyncio import CancelledError
+from contextlib import aclosing
 from time import time
 from typing import List, Optional
 from fastapi import HTTPException, Request
@@ -13,6 +14,7 @@ from common.logger import xlogger
 import re
 
 from common import model
+from common import zeta_metrics
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import (
     get_context_length_generator_error,
@@ -39,10 +41,17 @@ from endpoints.OAI.utils.stream_parser import (
     TagStreamParser,
 )
 from endpoints.OAI.utils.tools import (
+    ToolCallParseError,
     get_toolcall_tags,
     parse_toolcalls,
 )
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_usage_stats
+
+
+# A malformed model-emitted tool block is safe to retry because no tool has
+# executed yet. Keep this bounded: repeated malformed output must surface as
+# an explicit stream error rather than loop forever.
+TOOL_CALL_PARSE_RETRIES = 1
 
 
 def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
@@ -534,6 +543,7 @@ def _parse_tool_calls(
     text: str,
     tool_format: str,
     request_id: str,
+    tool_specs=None,
 ) -> list:
     """
     Parse collected tool calls and convert to OAI format.
@@ -543,7 +553,7 @@ def _parse_tool_calls(
     deltas, which we don't do here.)
     """
 
-    parsed = parse_toolcalls(text, tool_format)
+    parsed = parse_toolcalls(text, tool_format, tool_specs)
     for tc_idx, p in enumerate(parsed):
         p.index = tc_idx
     dumped = [p.model_dump(mode="json") for p in parsed]
@@ -600,6 +610,32 @@ def _reasoning_budget_injection(mc, message: str) -> Optional[str]:
     return message + suffix
 
 
+def _create_chat_stream_parser(mc, params, start_in_reasoning_mode):
+    """Create fresh channel parsing state for one generation attempt."""
+
+    if mc.harmony:
+        # Harmony messages carry their own channel structure, superseding the
+        # reasoning and tool format settings.
+        return "harmony", False, HarmonyStreamParser()
+    if mc.muse_glimmer:
+        # Same for Muse Glimmer, with recipients in place of channels.
+        return "muse_glimmer", False, GlimmerStreamParser()
+
+    tool_format = mc.tool_format
+    tool_start, tool_end = get_toolcall_tags(tool_format)
+    use_tool = params.tool_choice != "none" and bool(tool_start)
+    use_think = mc.reasoning and bool(mc.reasoning_start_token)
+    parser = TagStreamParser(
+        reasoning_start=mc.reasoning_start_token if use_think else None,
+        reasoning_end=mc.reasoning_end_token if use_think else None,
+        tool_start=tool_start if use_tool else None,
+        tool_end=tool_end if use_tool else None,
+        start_in_reasoning=start_in_reasoning_mode,
+        tool_calls_in_reasoning=mc.tool_calls_in_reasoning,
+    )
+    return tool_format, use_think, parser
+
+
 async def _chat_stream_collector(
     task_idx: int,
     gen_queue: asyncio.Queue | None,
@@ -625,166 +661,279 @@ async def _chat_stream_collector(
     """
 
     mc = model.container
-    full_reasoning = ""
-    full_content = ""
-    full_tool = ""
-
-    if mc.harmony:
-        # Harmony messages carry their own channel structure, superseding the
-        # reasoning and tool format settings
-        tool_format = "harmony"
-        use_think = False
-        parser = HarmonyStreamParser()
-    elif mc.muse_glimmer:
-        # Same for Muse Glimmer, with recipients in place of channels
-        tool_format = "muse_glimmer"
-        use_think = False
-        parser = GlimmerStreamParser()
-    else:
-        tool_format = mc.tool_format
-        t_tool_start, t_tool_end = get_toolcall_tags(tool_format)
-        use_tool = params.tool_choice != "none" and bool(t_tool_start)
-
-        use_think = mc.reasoning and bool(mc.reasoning_start_token)
-
-        parser = TagStreamParser(
-            reasoning_start=mc.reasoning_start_token if use_think else None,
-            reasoning_end=mc.reasoning_end_token if use_think else None,
-            tool_start=t_tool_start if use_tool else None,
-            tool_end=t_tool_end if use_tool else None,
-            start_in_reasoning=start_in_reasoning_mode,
-            tool_calls_in_reasoning=mc.tool_calls_in_reasoning,
-        )
-
-    # Reasoning budget: when the reasoning phase exceeds the budget, force
-    # end-of-reasoning tokens into the output stream so the model answers
-    # with what it has. The injected text arrives as regular output, so the
-    # parser transitions out of reasoning on its own.
-    budget, budget_message = _resolve_reasoning_budget(params, mc)
-    budget_injection = None
-    if budget is not None:
-        budget_injection = _reasoning_budget_injection(mc, budget_message)
-        if budget_injection is None:
-            xlogger.debug(
-                "A reasoning budget was requested but the model has no reasoning format; ignoring."
-            )
-        elif params.json_schema or params.regex_pattern or params.grammar_string:
-            # Injection permanently disables a job's filters
-            xlogger.warning(
-                "The reasoning budget is ignored because the request uses "
-                "constrained generation (json_schema, regex_pattern or "
-                "grammar_string)."
-            )
-            budget_injection = None
-    reasoning_tokens = 0
-
-    # Collect logprobs
-    collected_logprobs = []
+    zeta_metrics.request_started(request_id, mc.model_dir.name)
+    visible_content_emitted = False
 
     try:
-        new_generation = mc.stream_generate(
-            request_id,
-            prompt,
-            params,
-            disconnect_handler,
-            mm_embeddings,
-            filter_trigger=(
-                mc.reasoning_end_token if use_think and start_in_reasoning_mode else None
-            ),
-        )
-        generation = {"index": task_idx}
-        async for generation in new_generation:
-            generation["index"] = task_idx
-            text = generation.get("text", "")
-            finish_reason = generation.get("finish_reason")
+        for attempt in range(TOOL_CALL_PARSE_RETRIES + 1):
+            attempt_params = params.model_copy(deep=True)
+            backend_request_id = (
+                request_id if attempt == 0 else f"{request_id}-toolretry{attempt}"
+            )
+            buffer_retry = streaming_mode and attempt > 0
+            retry_attempt = False
 
-            events = parser.feed(text) if text else []
-            if finish_reason:
-                events += parser.finish()
+            full_reasoning = ""
+            full_content = ""
+            full_tool = ""
+            collected_logprobs = []
+            reasoning_tokens = 0
+            generation = {"index": task_idx}
+            saw_finish = False
 
-            delta_reasoning = ""
-            delta_content = ""
-            for channel, sub in events:
-                if channel == REASONING:
-                    delta_reasoning += sub
-                    full_reasoning += sub
-                elif channel == CONTENT:
-                    delta_content += sub
-                    full_content += sub
-                else:
-                    full_tool += sub
+            tool_format, use_think, parser = _create_chat_stream_parser(
+                mc, attempt_params, start_in_reasoning_mode
+            )
 
-            # Count reasoning tokens and force the end of the reasoning phase
-            # when the budget is exhausted. Attribution is approximate: a
-            # chunk counts as reasoning if the parser is still in reasoning
-            # after consuming it, and the injection lands a few tokens late
-            # (tokens sampled ahead of this consumer precede it).
-            if budget_injection is not None and parser.in_reasoning and not parser.in_tool:
-                reasoning_tokens += len(generation.get("token_ids") or [])
-                if reasoning_tokens >= budget:
-                    if mc.constrain_generation_output(request_id, budget_injection):
-                        xlogger.debug(
-                            f"Reasoning budget of {budget} tokens exhausted; "
-                            "forcing the end of the reasoning phase.",
-                            {"injection": budget_injection},
-                        )
+            # Reasoning budget: when the reasoning phase exceeds the budget,
+            # force the configured end-of-reasoning tokens into the output.
+            budget, budget_message = _resolve_reasoning_budget(attempt_params, mc)
+            budget_injection = None
+            if budget is not None:
+                budget_injection = _reasoning_budget_injection(mc, budget_message)
+                if budget_injection is None:
+                    xlogger.debug(
+                        "A reasoning budget was requested but the model has no "
+                        "reasoning format; ignoring."
+                    )
+                elif (
+                    attempt_params.json_schema
+                    or attempt_params.regex_pattern
+                    or attempt_params.grammar_string
+                ):
+                    xlogger.warning(
+                        "The reasoning budget is ignored because the request uses "
+                        "constrained generation (json_schema, regex_pattern or "
+                        "grammar_string)."
+                    )
                     budget_injection = None
 
-            # Collect logprobs in content span only, skipping chunks that
-            # contain a phase transition
-            if "logprobs_content" in generation and not parser.saw_tag and parser.in_content:
-                collected_logprobs += generation["logprobs_content"]
+            new_generation = mc.stream_generate(
+                backend_request_id,
+                prompt,
+                attempt_params,
+                disconnect_handler,
+                mm_embeddings,
+                filter_trigger=(
+                    mc.reasoning_end_token
+                    if use_think and start_in_reasoning_mode
+                    else None
+                ),
+            )
 
-            # Add the output and emit
-            if streaming_mode:
-                # A chunk can span the end of the reasoning phase (merged
-                # generator results). Emit the reasoning tail as its own
-                # delta so no SSE frame carries both reasoning_content and
-                # content: clients treat the first content delta as the
-                # phase transition.
-                if delta_reasoning and delta_content:
-                    await gen_queue.put(
-                        {"index": task_idx, "delta_reasoning_content": delta_reasoning}
-                    )
+            async with aclosing(new_generation):
+                async for generation in new_generation:
+                    generation["index"] = task_idx
+                    zeta_metrics.observe_generation(request_id, generation)
+                    text = generation.get("text", "")
+                    finish_reason = generation.get("finish_reason")
+                    saw_finish = saw_finish or bool(finish_reason)
+
+                    events = parser.feed(text) if text else []
+                    if finish_reason:
+                        events += parser.finish()
+
                     delta_reasoning = ""
+                    delta_content = ""
+                    for channel, sub in events:
+                        if channel == REASONING:
+                            delta_reasoning += sub
+                            full_reasoning += sub
+                        elif channel == CONTENT:
+                            delta_content += sub
+                            full_content += sub
+                        else:
+                            full_tool += sub
 
-                if delta_content:
-                    if len(collected_logprobs):
-                        generation["logprob_response"] = ChatCompletionLogprobs(
-                            content=collected_logprobs
+                    # Attribution is approximate: a chunk counts as reasoning
+                    # if the parser remains in reasoning after consuming it.
+                    if (
+                        budget_injection is not None
+                        and parser.in_reasoning
+                        and not parser.in_tool
+                    ):
+                        reasoning_tokens += len(generation.get("token_ids") or [])
+                        if reasoning_tokens >= budget:
+                            if mc.constrain_generation_output(
+                                backend_request_id, budget_injection
+                            ):
+                                xlogger.debug(
+                                    f"Reasoning budget of {budget} tokens exhausted; "
+                                    "forcing the end of the reasoning phase.",
+                                    {"injection": budget_injection},
+                                )
+                            budget_injection = None
+
+                    if (
+                        "logprobs_content" in generation
+                        and not parser.saw_tag
+                        and parser.in_content
+                    ):
+                        collected_logprobs += generation["logprobs_content"]
+
+                    if streaming_mode and not buffer_retry:
+                        parsed_tool_calls = []
+                        if finish_reason and full_tool:
+                            try:
+                                parsed_tool_calls = _parse_tool_calls(
+                                    full_tool,
+                                    tool_format,
+                                    request_id,
+                                    attempt_params.tools,
+                                )
+                            except ToolCallParseError as exc:
+                                # Retry inside this request even if commentary
+                                # or content has already reached the client.
+                                # Letting the exception escape after HTTP 200
+                                # tears down the SSE response, which Codex
+                                # reports as a transport reconnection. The
+                                # retry is buffered below so only its terminal
+                                # result is appended to the existing stream.
+                                if attempt < TOOL_CALL_PARSE_RETRIES:
+                                    xlogger.warning(
+                                        "Malformed tool call; retrying generation once",
+                                        {
+                                            "request_id": request_id,
+                                            "tool_format": tool_format,
+                                            "error": str(exc),
+                                            "visible_content_emitted": visible_content_emitted,
+                                        },
+                                    )
+                                    retry_attempt = True
+                                    break
+                                raise
+
+                        # A chunk can span the reasoning/content transition.
+                        if delta_reasoning and delta_content:
+                            await gen_queue.put(
+                                {
+                                    "index": task_idx,
+                                    "delta_reasoning_content": delta_reasoning,
+                                }
+                            )
+                            delta_reasoning = ""
+
+                        if delta_content:
+                            if delta_content.strip():
+                                visible_content_emitted = True
+                            if collected_logprobs:
+                                generation["logprob_response"] = ChatCompletionLogprobs(
+                                    content=collected_logprobs
+                                )
+                                collected_logprobs = []
+                        generation["delta_reasoning_content"] = delta_reasoning
+                        generation["delta_content"] = delta_content
+                        generation["delta_tool_calls"] = parsed_tool_calls
+                        if parsed_tool_calls:
+                            generation["finish_reason"] = "tool_calls"
+                        await gen_queue.put(generation)
+
+                    if finish_reason:
+                        break
+
+            if retry_attempt:
+                if disconnect_handler is not None:
+                    await disconnect_handler.poll()
+                continue
+
+            if not saw_finish:
+                raise RuntimeError("model generation ended without a terminal status")
+
+            if streaming_mode and buffer_retry:
+                parsed_tool_calls = []
+                retry_parse_error = None
+                if full_tool:
+                    try:
+                        parsed_tool_calls = _parse_tool_calls(
+                            full_tool,
+                            tool_format,
+                            request_id,
+                            attempt_params.tools,
                         )
-                        collected_logprobs = []
-                generation["delta_reasoning_content"] = delta_reasoning
-                generation["delta_content"] = delta_content
-                generation["delta_tool_calls"] = ""
-                if finish_reason and full_tool:
-                    generation["delta_tool_calls"] = _parse_tool_calls(
-                        full_tool, tool_format, request_id
-                    )
+                    except ToolCallParseError as exc:
+                        retry_parse_error = exc
+
+                # The retry is hidden while it runs. Prefer a validated call;
+                # if the model changes its mind and answers normally, append
+                # that answer and close the SSE stream cleanly. A normal
+                # terminal chunk is also safer than aborting a 200 response
+                # when both attempts produce malformed tool syntax.
+                if parsed_tool_calls:
+                    generation["delta_reasoning_content"] = ""
+                    generation["delta_content"] = ""
+                    generation["delta_tool_calls"] = parsed_tool_calls
                     generation["finish_reason"] = "tool_calls"
-                await gen_queue.put(generation)
+                    await gen_queue.put(generation)
+                else:
+                    fallback_content = full_content
+                    if not fallback_content.strip() and not visible_content_emitted:
+                        fallback_content = (
+                            "I couldn't complete the requested tool call. Please try again."
+                        )
+                    xlogger.warning(
+                        "Tool-call retry completed without a validated call; "
+                        "closing the stream normally",
+                        {
+                            "request_id": request_id,
+                            "tool_format": tool_format,
+                            "error": str(retry_parse_error or "no tool call emitted"),
+                            "visible_content_emitted": visible_content_emitted,
+                            "fallback_content_emitted": bool(fallback_content),
+                        },
+                    )
+                    generation["delta_reasoning_content"] = ""
+                    generation["delta_content"] = fallback_content
+                    generation["delta_tool_calls"] = []
+                    generation["finish_reason"] = "stop"
+                    await gen_queue.put(generation)
+                return
 
-            # End
-            if finish_reason:
-                break
+            if not streaming_mode:
+                try:
+                    parsed_tool_calls = _parse_tool_calls(
+                        full_tool,
+                        tool_format,
+                        request_id,
+                        attempt_params.tools,
+                    )
+                except ToolCallParseError as exc:
+                    if attempt < TOOL_CALL_PARSE_RETRIES:
+                        xlogger.warning(
+                            "Malformed tool call; retrying generation once",
+                            {
+                                "request_id": request_id,
+                                "tool_format": tool_format,
+                                "error": str(exc),
+                            },
+                        )
+                        if disconnect_handler is not None:
+                            await disconnect_handler.poll()
+                        continue
+                    raise
 
-        # In non-streaming mode, return everything as a single result
-        if not streaming_mode:
-            has_content = bool(full_content.strip())
-            if has_content and len(collected_logprobs):
-                generation["logprob_response"] = ChatCompletionLogprobs(content=collected_logprobs)
-            generation["reasoning_content"] = full_reasoning
-            generation["content"] = full_content if has_content else None
-            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, request_id)
-            if full_tool:
-                generation["finish_reason"] = "tool_calls"
-            return generation
+                has_content = bool(full_content.strip())
+                if has_content and collected_logprobs:
+                    generation["logprob_response"] = ChatCompletionLogprobs(
+                        content=collected_logprobs
+                    )
+                generation["reasoning_content"] = full_reasoning
+                generation["content"] = full_content if has_content else None
+                generation["tool_calls"] = parsed_tool_calls
+                if parsed_tool_calls:
+                    generation["finish_reason"] = "tool_calls"
+                return generation
+
+            return
+
+        raise ToolCallParseError("tool-call retry attempts were exhausted")
 
     except Exception as e:
         if gen_queue:
             await gen_queue.put(e)
         else:
             return e
+    finally:
+        zeta_metrics.request_finished(request_id)
 
 
 async def stream_generate_chat_completion(
@@ -893,6 +1042,11 @@ async def stream_generate_chat_completion(
         yield get_generator_error("Chat completion aborted. Please check the server console.")
 
     finally:
+        for task in gen_tasks:
+            if not task.done():
+                task.cancel()
+        if gen_tasks:
+            await asyncio.gather(*gen_tasks, return_exceptions=True)
         await disconnect_handler.cleanup()
 
 
@@ -905,7 +1059,10 @@ async def generate_chat_completion(
     disconnect_handler: DisconnectHandler,
 ):
     gen_tasks: List[asyncio.Task] = []
-    return_usage = data.stream_options and data.stream_options.include_usage
+    # OpenAI-compatible non-streaming responses include usage by default.
+    # The Responses bridge depends on this when Codex performs a non-streaming
+    # request, so do not require the streaming-only opt-in flag here.
+    return_usage = True
 
     try:
         xlogger.info(
@@ -970,4 +1127,9 @@ async def generate_chat_completion(
         raise HTTPException(503, error_message) from exc
 
     finally:
+        for task in gen_tasks:
+            if not task.done():
+                task.cancel()
+        if gen_tasks:
+            await asyncio.gather(*gen_tasks, return_exceptions=True)
         await disconnect_handler.cleanup()

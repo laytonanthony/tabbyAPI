@@ -1537,6 +1537,20 @@ class ExllamaV3Container:
                 await job.cancel()
 
         except Exception as ex:
+            # ExLlamaV3 stops its async generator after a fatal inference
+            # error, but its error path does not release the failed job's KV
+            # pages or recurrent-state slot. With max_batch_size=1 that makes
+            # every later request fail with "no available slots", even after
+            # Tabby recreates the generator. Release those allocations before
+            # rebuilding it. deallocate_pages() is safe when nothing remains.
+            try:
+                job.job.deallocate_pages()
+            except Exception as cleanup_ex:
+                xlogger.warning(
+                    "Could not fully release the failed ExLlamaV3 job before "
+                    f"generator recovery: {cleanup_ex}"
+                )
+
             # Create a new generator since the current state is broken
             # No need to wait for this to finish
             xlogger.error(

@@ -27,6 +27,7 @@ class TokenEncodeRequest(CommonTokenRequest):
     """Represents a tokenization request."""
 
     text: Union[str, List[ChatCompletionMessage]]
+    add_generation_prompt: bool = False
     template_vars: Optional[dict] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("template_vars", "chat_template_kwargs"),

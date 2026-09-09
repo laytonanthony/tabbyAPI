@@ -27,29 +27,90 @@ JSON-based tool call format.
 TOOLCALL_START = "<minimax:tool_call>"
 TOOLCALL_END = "</minimax:tool_call>"
 
-_OUTER = re.compile(r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL)
-_INVOKE = re.compile(r'<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>', re.DOTALL)
-_PARAM = re.compile(r'<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>', re.DOTALL)
+_OUTER = re.compile(
+    r"\s*<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
+)
+_INVOKE = re.compile(r'\s*<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL)
+_PARAM = re.compile(
+    r'\s*<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL
+)
+
+
+def _parse_parameters(func_body: str, func_name: str) -> dict[str, any]:
+    args: dict[str, any] = {}
+    cursor = 0
+
+    while cursor < len(func_body):
+        match = _PARAM.match(func_body, cursor)
+        if match is None:
+            if func_body[cursor:].strip():
+                raise ValueError(
+                    f"Malformed parameter markup in MiniMax tool call {func_name!r}"
+                )
+            break
+
+        key = match.group(1).strip()
+        if not key:
+            raise ValueError(f"Blank parameter name in MiniMax tool call {func_name!r}")
+        if key in args:
+            raise ValueError(
+                f"Duplicate parameter {key!r} in MiniMax tool call {func_name!r}"
+            )
+
+        args[key] = coerce_param_value(match.group(2))
+        cursor = match.end()
+
+    return args
+
+
+def _parse_invocations(text: str) -> list[ToolCall]:
+    results: list[ToolCall] = []
+    cursor = 0
+
+    while cursor < len(text):
+        match = _INVOKE.match(text, cursor)
+        if match is None:
+            if text[cursor:].strip():
+                raise ValueError("Malformed or misordered MiniMax invoke markup")
+            break
+
+        func_name = match.group(1).strip()
+        if not func_name:
+            raise ValueError("Blank function name in MiniMax tool call")
+
+        args = _parse_parameters(match.group(2), func_name)
+        results.append(
+            ToolCall(
+                function=Tool(
+                    name=func_name,
+                    arguments=json.dumps(args, ensure_ascii=False),
+                )
+            )
+        )
+        cursor = match.end()
+
+    if not results:
+        raise ValueError("MiniMax wrapper did not contain a complete invocation")
+    return results
 
 
 def parse_toolcalls(text: str) -> list[ToolCall]:
-    outer_matches = list(_OUTER.finditer(text))
+    if not text.strip():
+        return []
 
-    results = []
-    for om in outer_matches:
-        inner = om.group(1)
-        for im in _INVOKE.finditer(inner):
-            func_name = im.group(1)
-            func_body = im.group(2)
-            args: dict[str, any] = {}
-            for pm in _PARAM.finditer(func_body):
-                key = pm.group(1).strip()
-                val = pm.group(2).strip()
-                val = coerce_param_value(val)
-                args[key] = val
+    results: list[ToolCall] = []
+    cursor = 0
+    while cursor < len(text):
+        match = _OUTER.match(text, cursor)
+        if match is None:
+            if text[cursor:].strip():
+                raise ValueError("Malformed or unmatched MiniMax tool_call wrapper")
+            break
+        results.extend(_parse_invocations(match.group(1)))
+        cursor = match.end()
 
-            args_json = json.dumps(args, ensure_ascii=False)
-            results.append(ToolCall(function=Tool(name=func_name, arguments=args_json)))
+    if not results:
+        raise ValueError("MiniMax tool output did not contain a complete tool call")
 
     xlogger.debug(
         f"minimax_m2: Parsed {len(results)} tool calls",

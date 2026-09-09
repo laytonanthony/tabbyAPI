@@ -1,4 +1,3 @@
-import re
 import json
 from common.logger import xlogger
 from endpoints.OAI.types.tools import ToolCall, Tool
@@ -24,46 +23,73 @@ There is no end token; tool calls simply appear at the end of the response strea
 TOOLCALL_START = "[TOOL_CALLS]"
 TOOLCALL_END = None
 
-# Match [TOOL_CALLS] followed by a JSON array
-_TOOLCALL_BLOCK = re.compile(r"\[TOOL_CALLS]\s*(\[.*])", re.DOTALL)
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"mistral_old: Duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_constant(value: str):
+    raise ValueError(f"mistral_old: Non-standard JSON constant {value!r}")
+
+
+def _load_json(raw_json: str):
+    return json.loads(
+        raw_json,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_nonstandard_constant,
+    )
 
 
 def parse_toolcalls(text: str) -> list[ToolCall]:
-    match = _TOOLCALL_BLOCK.search(text)
-    if not match:
+    marker_pos = text.find(TOOLCALL_START)
+    if marker_pos == -1:
         return []
 
-    raw_json = match.group(1)
+    raw_json = text[marker_pos + len(TOOLCALL_START) :].strip()
+    if not raw_json:
+        raise ValueError("mistral_old: Tool-call batch has no JSON payload")
 
     try:
-        calls = json.loads(raw_json)
-    except json.JSONDecodeError as e:
+        calls = _load_json(raw_json)
+    except (json.JSONDecodeError, ValueError) as exc:
         xlogger.warning(
             "mistral_old: Failed to parse tool call JSON",
-            {"exception": str(e), "raw_text": text, "raw_json": raw_json},
+            {"exception": str(exc), "raw_text": text, "raw_json": raw_json},
         )
-        return []
+        raise ValueError("mistral_old: Tool-call batch JSON is malformed") from exc
 
     if not isinstance(calls, list):
-        calls = [calls]
+        raise ValueError("mistral_old: Tool-call batch must be a JSON array")
+    if not calls:
+        raise ValueError("mistral_old: Tool-call batch must contain at least one call")
 
     results = []
     for call in calls:
         if not isinstance(call, dict):
-            continue
+            raise ValueError("mistral_old: Every tool call must be a JSON object")
         func_name = call.get("name")
-        if not func_name:
-            continue
+        if not isinstance(func_name, str) or not func_name.strip():
+            raise ValueError("mistral_old: Tool call has no valid function name")
+        func_name = func_name.strip()
         arguments = call.get("arguments", {})
         if isinstance(arguments, str):
             try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                pass
+                arguments = _load_json(arguments)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError("mistral_old: String arguments contain invalid JSON") from exc
+        if not isinstance(arguments, dict):
+            raise ValueError("mistral_old: Tool call arguments must be a JSON object")
         args_json = json.dumps(arguments, ensure_ascii=False)
         func = Tool(name=func_name, arguments=args_json)
         if "id" in call:
-            results.append(ToolCall(id=call["id"], function=func))
+            call_id = call["id"]
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ValueError("mistral_old: Tool call id must be a non-empty string")
+            results.append(ToolCall(id=call_id, function=func))
         else:
             results.append(ToolCall(function=func))
 

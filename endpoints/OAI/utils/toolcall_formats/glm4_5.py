@@ -1,6 +1,5 @@
 import re
 import json
-from itertools import zip_longest
 from common.logger import xlogger
 from endpoints.OAI.types.tools import ToolCall, Tool
 from endpoints.OAI.utils.toolcall_formats.common import coerce_param_value
@@ -31,8 +30,7 @@ TOOLCALL_END = "</tool_call>"
 
 _OUTER = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _FUNC_NAME = re.compile(r"^(.*?)(?=<arg_key>|$)", re.DOTALL)
-_ARG_KEY = re.compile(r"<arg_key>(.*?)</arg_key>", re.DOTALL)
-_ARG_VALUE = re.compile(r"<arg_value>(.*?)</arg_value>", re.DOTALL)
+_ARG_TOKEN = re.compile(r"<arg_(key|value)>(.*?)</arg_\1>", re.DOTALL)
 
 
 def parse_toolcalls(text: str) -> list[ToolCall]:
@@ -50,13 +48,30 @@ def parse_toolcalls(text: str) -> list[ToolCall]:
         if not func_name:
             continue
 
-        # Extract interleaved key/value pairs
-        keys = [m.group(1).strip() for m in _ARG_KEY.finditer(inner)]
-        values = [m.group(1).strip() for m in _ARG_VALUE.finditer(inner)]
+        # Preserve the emitted order. Extracting keys and values separately
+        # can shift later values onto the wrong keys when one tag is missing.
+        # Reject the entire call instead of risking a partially reconstructed
+        # command with different semantics.
+        tokens = [(m.group(1), m.group(2)) for m in _ARG_TOKEN.finditer(inner)]
+        key_markers = inner.count("<arg_key>")
+        value_markers = inner.count("<arg_value>")
+        if key_markers != value_markers or len(tokens) != key_markers + value_markers:
+            raise ValueError("unmatched GLM argument key/value tag")
+        if len(tokens) % 2:
+            raise ValueError("incomplete GLM argument key/value pair")
 
         args: dict[str, any] = {}
-        for key, val in zip_longest(keys, values):
-            args[key] = coerce_param_value(val)
+        for index in range(0, len(tokens), 2):
+            key_type, raw_key = tokens[index]
+            value_type, raw_value = tokens[index + 1]
+            if key_type != "key" or value_type != "value":
+                raise ValueError("misordered GLM argument key/value pair")
+            key = raw_key.strip()
+            if not key:
+                raise ValueError("blank GLM argument key")
+            if key in args:
+                raise ValueError(f"duplicate GLM argument key {key!r}")
+            args[key] = coerce_param_value(raw_value)
 
         args_json = json.dumps(args, ensure_ascii=False)
         results.append(ToolCall(function=Tool(name=func_name, arguments=args_json)))
