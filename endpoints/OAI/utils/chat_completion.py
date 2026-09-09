@@ -45,6 +45,7 @@ from endpoints.OAI.utils.tools import (
     ToolCallParseError,
     get_toolcall_tags,
     parse_toolcalls,
+    parse_zeta_search_pseudo_toolcall,
 )
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_usage_stats
 
@@ -591,6 +592,76 @@ def _parse_tool_calls(
     return dumped
 
 
+def _parse_zeta_search_pseudo_tool_calls(
+    text: str,
+    request_id: str,
+    tool_specs=None,
+) -> list:
+    """Validate and serialize a narrowly recoverable Zeta search pseudo-call."""
+
+    parsed = parse_zeta_search_pseudo_toolcall(text, tool_specs) or []
+    for tc_idx, item in enumerate(parsed):
+        item.index = tc_idx
+    dumped = [item.model_dump(mode="json") for item in parsed]
+    if dumped:
+        xlogger.warning(
+            "Promoted Zeta search pseudo-call to a validated native tool call",
+            {"request_id": request_id, "count": len(dumped)},
+        )
+    return dumped
+
+
+class _PseudoToolContentBuffer:
+    """Hold a line-start ``To:`` suffix until it can be validated at EOS."""
+
+    _marker = re.compile(r"(?:^|\n)To:")
+    _lookbehind = len("\nTo:") - 1
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._capturing = False
+
+    def feed(self, text: str) -> str:
+        self._pending += text
+        if self._capturing:
+            return ""
+
+        marker = self._marker.search(self._pending)
+        if marker is not None:
+            marker_start = marker.start()
+            while marker_start > 0 and self._pending[marker_start - 1] in "\r\n":
+                marker_start -= 1
+            visible = self._pending[:marker_start]
+            self._pending = self._pending[marker_start:]
+            self._capturing = True
+            return visible
+
+        if len(self._pending) <= self._lookbehind:
+            return ""
+        visible = self._pending[: -self._lookbehind]
+        self._pending = self._pending[-self._lookbehind :]
+        return visible
+
+    def flush(self) -> str:
+        pending, self._pending = self._pending, ""
+        self._capturing = False
+        return pending
+
+    def discard(self) -> None:
+        self._pending = ""
+        self._capturing = False
+
+
+def _should_buffer_zeta_search_pseudo_call(params: ChatCompletionRequest) -> bool:
+    return params.tool_choice != "none" and bool(
+        params.tools
+        and any(
+            spec.function.name == "zeta_search__web_search"
+            for spec in params.tools
+        )
+    )
+
+
 def _resolve_reasoning_budget(data: ChatCompletionRequest, mc) -> tuple[Optional[int], str]:
     """
     Resolve the reasoning token budget and forced message from the request and
@@ -716,6 +787,13 @@ async def _chat_stream_collector(
             tool_format, use_think, parser = _create_chat_stream_parser(
                 mc, attempt_params, start_in_reasoning_mode
             )
+            pseudo_content_buffer = (
+                _PseudoToolContentBuffer()
+                if streaming_mode
+                and not buffer_retry
+                and _should_buffer_zeta_search_pseudo_call(attempt_params)
+                else None
+            )
 
             # Reasoning budget: when the reasoning phase exceeds the budget,
             # force the configured end-of-reasoning tokens into the output.
@@ -806,14 +884,31 @@ async def _chat_stream_collector(
 
                     if streaming_mode and not buffer_retry:
                         parsed_tool_calls = []
-                        if finish_reason and full_tool:
+                        promoted_pseudo_call = False
+                        if finish_reason and (
+                            full_tool
+                            or (
+                                full_content
+                                and attempt_params.tool_choice != "none"
+                            )
+                        ):
                             try:
-                                parsed_tool_calls = _parse_tool_calls(
-                                    full_tool,
-                                    tool_format,
-                                    request_id,
-                                    attempt_params.tools,
-                                )
+                                if full_tool:
+                                    parsed_tool_calls = _parse_tool_calls(
+                                        full_tool,
+                                        tool_format,
+                                        request_id,
+                                        attempt_params.tools,
+                                    )
+                                else:
+                                    parsed_tool_calls = (
+                                        _parse_zeta_search_pseudo_tool_calls(
+                                            full_content,
+                                            request_id,
+                                            attempt_params.tools,
+                                        )
+                                    )
+                                    promoted_pseudo_call = bool(parsed_tool_calls)
                             except ToolCallParseError as exc:
                                 # Retry inside this request even if commentary
                                 # or content has already reached the client.
@@ -846,6 +941,14 @@ async def _chat_stream_collector(
                             )
                             delta_reasoning = ""
 
+                        if pseudo_content_buffer is not None:
+                            delta_content = pseudo_content_buffer.feed(delta_content)
+                            if finish_reason:
+                                if promoted_pseudo_call:
+                                    pseudo_content_buffer.discard()
+                                else:
+                                    delta_content += pseudo_content_buffer.flush()
+
                         if delta_content:
                             if delta_content.strip():
                                 visible_content_emitted = True
@@ -875,14 +978,25 @@ async def _chat_stream_collector(
             if streaming_mode and buffer_retry:
                 parsed_tool_calls = []
                 retry_parse_error = None
-                if full_tool:
+                if full_tool or (
+                    full_content and attempt_params.tool_choice != "none"
+                ):
                     try:
-                        parsed_tool_calls = _parse_tool_calls(
-                            full_tool,
-                            tool_format,
-                            request_id,
-                            attempt_params.tools,
-                        )
+                        if full_tool:
+                            parsed_tool_calls = _parse_tool_calls(
+                                full_tool,
+                                tool_format,
+                                request_id,
+                                attempt_params.tools,
+                            )
+                        else:
+                            parsed_tool_calls = (
+                                _parse_zeta_search_pseudo_tool_calls(
+                                    full_content,
+                                    request_id,
+                                    attempt_params.tools,
+                                )
+                            )
                     except ToolCallParseError as exc:
                         retry_parse_error = exc
 
@@ -923,12 +1037,23 @@ async def _chat_stream_collector(
 
             if not streaming_mode:
                 try:
-                    parsed_tool_calls = _parse_tool_calls(
-                        full_tool,
-                        tool_format,
-                        request_id,
-                        attempt_params.tools,
-                    )
+                    if full_tool:
+                        parsed_tool_calls = _parse_tool_calls(
+                            full_tool,
+                            tool_format,
+                            request_id,
+                            attempt_params.tools,
+                        )
+                    elif attempt_params.tool_choice != "none":
+                        parsed_tool_calls = (
+                            _parse_zeta_search_pseudo_tool_calls(
+                                full_content,
+                                request_id,
+                                attempt_params.tools,
+                            )
+                        )
+                    else:
+                        parsed_tool_calls = []
                 except ToolCallParseError as exc:
                     if attempt < TOOL_CALL_PARSE_RETRIES:
                         xlogger.warning(

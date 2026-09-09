@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pathlib
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,10 @@ VALID = (
     "<tool_call>run"
     "<arg_key>cmd</arg_key><arg_value>dir</arg_value>"
     "</tool_call>"
+)
+PSEUDO_SEARCH = (
+    "On it — searching now.\n\n"
+    'To: zeta_search/web_search\n{"query":"GPU Spain","num_results":8}'
 )
 
 
@@ -31,6 +36,31 @@ def request_with_tool(max_tokens=None):
                         "type": "object",
                         "properties": {"cmd": {"type": "string"}},
                         "required": ["cmd"],
+                        "additionalProperties": False,
+                    },
+                ),
+            )
+        ],
+    )
+
+
+def request_with_search_tool(tool_choice="auto"):
+    return ChatCompletionRequest(
+        messages=[{"role": "user", "content": "search for a GPU"}],
+        tool_choice=tool_choice,
+        tools=[
+            ToolSpec(
+                type="function",
+                function=Function(
+                    name="zeta_search__web_search",
+                    description="search the web",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "count": {"type": "integer"},
+                        },
+                        "required": ["query"],
                         "additionalProperties": False,
                     },
                 ),
@@ -240,6 +270,158 @@ class ToolCallRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued[0]["delta_content"], "answer in progress")
         self.assertEqual(queued[-1]["delta_content"], "")
         self.assertEqual(queued[-1]["finish_reason"], "stop")
+
+    async def test_stream_promotes_valid_zeta_search_pseudo_call(self):
+        container = DummyContainer([[terminal(PSEUDO_SEARCH)]])
+        queue = asyncio.Queue()
+        with (
+            patch.object(chat_completion.model, "container", container),
+            patch.object(chat_completion.zeta_metrics, "request_started"),
+            patch.object(chat_completion.zeta_metrics, "observe_generation"),
+            patch.object(chat_completion.zeta_metrics, "request_finished"),
+        ):
+            await chat_completion._chat_stream_collector(
+                0,
+                queue,
+                "request-1",
+                "prompt",
+                request_with_search_tool(),
+                False,
+                streaming_mode=True,
+            )
+
+        queued = []
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["delta_content"], "On it — searching now.")
+        self.assertEqual(queued[0]["finish_reason"], "tool_calls")
+        call = queued[0]["delta_tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "zeta_search__web_search")
+        self.assertEqual(
+            json.loads(call["function"]["arguments"]),
+            {"query": "GPU Spain", "count": 8},
+        )
+
+    async def test_stream_promotes_pseudo_call_split_across_chunks(self):
+        container = DummyContainer(
+            [
+                [
+                    terminal("On it — searching now.\n\nTo: zeta_", None),
+                    terminal(
+                        'search/web_search\n{"query":"GPU Spain","num_results":8}'
+                    ),
+                ]
+            ]
+        )
+        queue = asyncio.Queue()
+        with (
+            patch.object(chat_completion.model, "container", container),
+            patch.object(chat_completion.zeta_metrics, "request_started"),
+            patch.object(chat_completion.zeta_metrics, "observe_generation"),
+            patch.object(chat_completion.zeta_metrics, "request_finished"),
+        ):
+            await chat_completion._chat_stream_collector(
+                0,
+                queue,
+                "request-1",
+                "prompt",
+                request_with_search_tool(),
+                False,
+                streaming_mode=True,
+            )
+
+        queued = []
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+        self.assertNotIn(
+            "To: zeta_search/web_search",
+            "".join(item["delta_content"] for item in queued),
+        )
+        self.assertEqual(queued[-1]["finish_reason"], "tool_calls")
+        self.assertEqual(
+            queued[-1]["delta_tool_calls"][0]["function"]["name"],
+            "zeta_search__web_search",
+        )
+
+    async def test_stream_buffer_preserves_non_candidate_content(self):
+        original = "Send this\nTo: Anthony\nwhen you are ready."
+        container = DummyContainer(
+            [[terminal("Send this\nTo:", None), terminal(" Anthony\nwhen you are ready.")]]
+        )
+        queue = asyncio.Queue()
+        with (
+            patch.object(chat_completion.model, "container", container),
+            patch.object(chat_completion.zeta_metrics, "request_started"),
+            patch.object(chat_completion.zeta_metrics, "observe_generation"),
+            patch.object(chat_completion.zeta_metrics, "request_finished"),
+        ):
+            await chat_completion._chat_stream_collector(
+                0,
+                queue,
+                "request-1",
+                "prompt",
+                request_with_search_tool(),
+                False,
+                streaming_mode=True,
+            )
+
+        queued = []
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+        self.assertEqual("".join(item["delta_content"] for item in queued), original)
+        self.assertEqual(queued[-1]["finish_reason"], "stop")
+
+    async def test_nonstream_promotes_valid_zeta_search_pseudo_call(self):
+        container = DummyContainer([[terminal(PSEUDO_SEARCH)]])
+        with (
+            patch.object(chat_completion.model, "container", container),
+            patch.object(chat_completion.zeta_metrics, "request_started"),
+            patch.object(chat_completion.zeta_metrics, "observe_generation"),
+            patch.object(chat_completion.zeta_metrics, "request_finished"),
+        ):
+            result = await chat_completion._chat_stream_collector(
+                0,
+                None,
+                "request-1",
+                "prompt",
+                request_with_search_tool(),
+                False,
+                streaming_mode=False,
+            )
+
+        self.assertEqual(result["finish_reason"], "tool_calls")
+        self.assertEqual(
+            result["tool_calls"][0]["function"]["name"],
+            "zeta_search__web_search",
+        )
+
+    async def test_tool_choice_none_leaves_pseudo_call_as_content(self):
+        container = DummyContainer([[terminal(PSEUDO_SEARCH)]])
+        queue = asyncio.Queue()
+        with (
+            patch.object(chat_completion.model, "container", container),
+            patch.object(chat_completion.zeta_metrics, "request_started"),
+            patch.object(chat_completion.zeta_metrics, "observe_generation"),
+            patch.object(chat_completion.zeta_metrics, "request_finished"),
+        ):
+            await chat_completion._chat_stream_collector(
+                0,
+                queue,
+                "request-1",
+                "prompt",
+                request_with_search_tool(tool_choice="none"),
+                False,
+                streaming_mode=True,
+            )
+
+        queued = []
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["delta_content"], PSEUDO_SEARCH)
+        self.assertEqual(queued[0]["delta_tool_calls"], [])
+        self.assertEqual(queued[0]["finish_reason"], "stop")
 
 
 if __name__ == "__main__":

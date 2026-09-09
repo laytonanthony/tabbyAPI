@@ -1,7 +1,12 @@
+import json
 import unittest
 
 from endpoints.OAI.types.tools import Function, ToolSpec
-from endpoints.OAI.utils.tools import ToolCallParseError, parse_toolcalls
+from endpoints.OAI.utils.tools import (
+    ToolCallParseError,
+    parse_toolcalls,
+    parse_zeta_search_pseudo_toolcall,
+)
 
 
 def tool_spec(name="f", required=None, additional_properties=False):
@@ -16,6 +21,25 @@ def tool_spec(name="f", required=None, additional_properties=False):
                 "properties": properties,
                 "required": required or [],
                 "additionalProperties": additional_properties,
+            },
+        ),
+    )
+
+
+def search_tool_spec():
+    return ToolSpec(
+        type="function",
+        function=Function(
+            name="zeta_search__web_search",
+            description="search the web",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
             },
         ),
     )
@@ -90,6 +114,88 @@ class SharedToolCallValidationTests(unittest.TestCase):
         )
         with self.assertRaises(ToolCallParseError):
             parse_toolcalls(raw, "glm4_5", [tool_spec("f", ["cmd"])])
+
+    def test_promotes_zeta_search_pseudo_call_and_maps_count_alias(self):
+        raw = (
+            "On it — searching now.\n\n"
+            'To: zeta_search/web_search\n{"query":"GPU Spain","num_results":8}'
+        )
+        calls = parse_zeta_search_pseudo_toolcall(raw, [search_tool_spec()])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "zeta_search__web_search")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"query": "GPU Spain", "count": 8},
+        )
+
+    def test_pseudo_call_requires_exact_delivered_search_tool(self):
+        raw = 'To: zeta_search/web_search\n{"query":"GPU Spain"}'
+        with self.assertRaises(ToolCallParseError):
+            parse_zeta_search_pseudo_toolcall(raw, [tool_spec("web_search")])
+
+    def test_pseudo_call_rejects_duplicate_or_ambiguous_count(self):
+        duplicate = (
+            'To: zeta_search/web_search\n'
+            '{"query":"GPU","query":"CPU"}'
+        )
+        both_counts = (
+            'To: zeta_search/web_search\n'
+            '{"query":"GPU","count":5,"num_results":8}'
+        )
+        with self.assertRaises(ToolCallParseError):
+            parse_zeta_search_pseudo_toolcall(duplicate, [search_tool_spec()])
+        with self.assertRaises(ToolCallParseError):
+            parse_zeta_search_pseudo_toolcall(both_counts, [search_tool_spec()])
+
+    def test_pseudo_call_enforces_search_argument_types_and_range(self):
+        wrong_type = (
+            'To: zeta_search/web_search\n{"query":"GPU","count":"eight"}'
+        )
+        out_of_range = 'To: zeta_search/web_search\n{"query":"GPU","count":11}'
+
+        with self.assertRaises(ToolCallParseError):
+            parse_zeta_search_pseudo_toolcall(wrong_type, [search_tool_spec()])
+        with self.assertRaises(ToolCallParseError):
+            parse_zeta_search_pseudo_toolcall(out_of_range, [search_tool_spec()])
+
+    def test_pseudo_call_enforces_required_and_additional_properties(self):
+        missing_query = 'To: zeta_search/web_search\n{"count":8}'
+        extra_argument = (
+            'To: zeta_search/web_search\n{"query":"GPU","country":"Spain"}'
+        )
+
+        with self.assertRaises(ToolCallParseError):
+            parse_zeta_search_pseudo_toolcall(missing_query, [search_tool_spec()])
+        with self.assertRaises(ToolCallParseError):
+            parse_zeta_search_pseudo_toolcall(extra_argument, [search_tool_spec()])
+
+    def test_embedded_or_fenced_pseudo_call_remains_content(self):
+        embedded = (
+            'Here is an example: To: zeta_search/web_search\n{"query":"GPU"}'
+        )
+        newline_example = (
+            "Here is an example:\n"
+            'To: zeta_search/web_search\n{"query":"GPU"}'
+        )
+        search_example = (
+            "Example of searching:\n"
+            'To: zeta_search/web_search\n{"query":"GPU"}'
+        )
+        fenced = '```\nTo: zeta_search/web_search\n{"query":"GPU"}\n```'
+
+        self.assertIsNone(
+            parse_zeta_search_pseudo_toolcall(embedded, [search_tool_spec()])
+        )
+        self.assertIsNone(
+            parse_zeta_search_pseudo_toolcall(newline_example, [search_tool_spec()])
+        )
+        self.assertIsNone(
+            parse_zeta_search_pseudo_toolcall(search_example, [search_tool_spec()])
+        )
+        self.assertIsNone(
+            parse_zeta_search_pseudo_toolcall(fenced, [search_tool_spec()])
+        )
 
 
 if __name__ == "__main__":

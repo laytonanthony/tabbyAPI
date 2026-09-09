@@ -1,10 +1,11 @@
 """Tool call processing utilities for OAI server."""
 
 import json
+import re
 from typing import List, Optional, Sequence
 
 from common.logger import xlogger
-from endpoints.OAI.types.tools import ToolCall, ToolSpec
+from endpoints.OAI.types.tools import Tool, ToolCall, ToolSpec
 from endpoints.OAI.utils.toolcall_formats import (
     qwen3_coder,
     minimax_m2,
@@ -50,6 +51,154 @@ ALL_TOOLCALL_FORMATS = {
 
 class ToolCallParseError(ValueError):
     """Raised when model-emitted tool syntax cannot be handled safely."""
+
+
+_ZETA_SEARCH_PSEUDO_CALL = re.compile(
+    r"(?:^|\n)To:[ \t]*(zeta_search/web_search)[ \t]*\n"
+    r"([ \t]*\{.*\})[ \t]*\Z",
+    re.DOTALL,
+)
+_ZETA_SEARCH_ACTION_PREAMBLE = re.compile(
+    r"\b(search(?:ing)?|look(?:ing)?[ \t]+up|buscar|buscando|b[uú]squeda)\b",
+    re.IGNORECASE,
+)
+_ZETA_SEARCH_EXAMPLE_PREAMBLE = re.compile(
+    r"\b(example|sample|illustration|format|syntax|quote|ejemplo)\b",
+    re.IGNORECASE,
+)
+_ZETA_SEARCH_FUNCTION = "zeta_search__web_search"
+_ZETA_SEARCH_PREAMBLE_MAX_CHARS = 512
+
+
+def _json_object_without_duplicate_keys(raw: str, description: str) -> dict:
+    def reject_duplicate_keys(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ToolCallParseError(
+                    f"{description} repeats argument {key!r}"
+                )
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except ToolCallParseError:
+        raise
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ToolCallParseError(f"{description} has invalid JSON arguments") from exc
+    if not isinstance(value, dict):
+        raise ToolCallParseError(f"{description} arguments must be a JSON object")
+    return value
+
+
+def _validate_pseudo_argument_types(
+    arguments: dict,
+    schema: dict,
+    description: str,
+) -> None:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+
+    for name, value in arguments.items():
+        argument_schema = properties.get(name)
+        if not isinstance(argument_schema, dict):
+            continue
+        expected = argument_schema.get("type")
+        if expected == "string" and not isinstance(value, str):
+            raise ToolCallParseError(f"{description} argument {name!r} must be a string")
+        if expected == "integer" and (
+            not isinstance(value, int) or isinstance(value, bool)
+        ):
+            raise ToolCallParseError(f"{description} argument {name!r} must be an integer")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            minimum = argument_schema.get("minimum")
+            maximum = argument_schema.get("maximum")
+            if isinstance(minimum, (int, float)) and value < minimum:
+                raise ToolCallParseError(
+                    f"{description} argument {name!r} is below its minimum"
+                )
+            if isinstance(maximum, (int, float)) and value > maximum:
+                raise ToolCallParseError(
+                    f"{description} argument {name!r} exceeds its maximum"
+                )
+
+
+def parse_zeta_search_pseudo_toolcall(
+    text: str,
+    tool_specs: Optional[Sequence[ToolSpec]],
+) -> Optional[List[ToolCall]]:
+    """Promote a narrowly scoped Codex-style Zeta search call from prose.
+
+    Some local models occasionally copy Codex's visual ``To: namespace/tool``
+    notation instead of emitting their configured native tool envelope. Only
+    Zeta's read-only web search recipient is eligible, and only when the exact
+    flattened function is present in the request's tool schema. A preceding
+    sentence must explicitly describe a search action; unknown or explanatory
+    prose remains ordinary assistant content.
+    """
+
+    if not isinstance(text, str) or not tool_specs:
+        return None
+    match = _ZETA_SEARCH_PSEUDO_CALL.search(text.strip())
+    if not match:
+        return None
+
+    recipient, raw_arguments = match.groups()
+    preamble = text.strip()[: match.start()].strip()
+    if preamble and (
+        len(preamble) > _ZETA_SEARCH_PREAMBLE_MAX_CHARS
+        or not _ZETA_SEARCH_ACTION_PREAMBLE.search(preamble)
+        or _ZETA_SEARCH_EXAMPLE_PREAMBLE.search(preamble)
+    ):
+        return None
+
+    expected_name = _ZETA_SEARCH_FUNCTION
+    matching_specs = [
+        spec for spec in tool_specs if spec.function.name == expected_name
+    ]
+    if len(matching_specs) != 1:
+        raise ToolCallParseError(
+            f"pseudo tool recipient {recipient!r} is not uniquely available"
+        )
+
+    description = f"pseudo tool call {recipient!r}"
+    arguments = _json_object_without_duplicate_keys(raw_arguments, description)
+    schema = matching_specs[0].function.parameters
+
+    # This is the one legacy spelling observed from GLM. Keep the alias local
+    # to Zeta web search and require the delivered schema to prove that
+    # ``count`` is the intended field before changing it.
+    if "num_results" in arguments:
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if "count" in arguments:
+            raise ToolCallParseError(
+                f"{description} supplies both 'count' and 'num_results'"
+            )
+        if not isinstance(properties, dict) or "count" not in properties:
+            raise ToolCallParseError(
+                f"{description} cannot map 'num_results' without a 'count' schema"
+            )
+        if "num_results" in properties:
+            raise ToolCallParseError(
+                f"{description} has an ambiguous 'num_results' schema"
+            )
+        arguments["count"] = arguments.pop("num_results")
+
+    if isinstance(schema, dict):
+        _validate_pseudo_argument_types(arguments, schema, description)
+
+    parsed = [
+        ToolCall(
+            function=Tool(
+                name=expected_name,
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            )
+        )
+    ]
+    _validate_toolcalls(parsed, tool_specs)
+    return parsed
 
 
 def _get_parser(tool_format: str):
