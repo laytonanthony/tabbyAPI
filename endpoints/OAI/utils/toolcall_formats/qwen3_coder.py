@@ -28,38 +28,97 @@ Raw format:
 TOOLCALL_START = "<tool_call>"
 TOOLCALL_END = "</tool_call>"
 
-_OUTER = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-_FUNC = re.compile(r"<function=([^>\s]+)[^>]*>(.*?)</function>", re.DOTALL)
-_PARAM = re.compile(r"<parameter=([^>\s]+)[^>]*>(.*?)</parameter>", re.DOTALL)
+_OUTER = re.compile(r"\s*<tool_call>(.*?)</tool_call>", re.DOTALL)
+_FUNC = re.compile(r"\s*<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
+_PARAM = re.compile(r"\s*<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
+
+
+def _parse_parameters(func_body: str, func_name: str) -> dict[str, any]:
+    """Parse a complete, ordered parameter sequence for one function."""
+    args: dict[str, any] = {}
+    cursor = 0
+
+    while cursor < len(func_body):
+        match = _PARAM.match(func_body, cursor)
+        if match is None:
+            if func_body[cursor:].strip():
+                raise ValueError(
+                    f"Malformed parameter markup in Qwen tool call {func_name!r}"
+                )
+            break
+
+        key = match.group(1).strip()
+        if not key:
+            raise ValueError(f"Blank parameter name in Qwen tool call {func_name!r}")
+        if key in args:
+            raise ValueError(
+                f"Duplicate parameter {key!r} in Qwen tool call {func_name!r}"
+            )
+
+        args[key] = coerce_param_value(match.group(2))
+        cursor = match.end()
+
+    return args
+
+
+def _parse_functions(text: str) -> list[ToolCall]:
+    """Parse all function blocks, rejecting a partial parallel batch."""
+    results: list[ToolCall] = []
+    cursor = 0
+
+    while cursor < len(text):
+        match = _FUNC.match(text, cursor)
+        if match is None:
+            if text[cursor:].strip():
+                raise ValueError("Malformed or misordered Qwen function markup")
+            break
+
+        func_name = match.group(1).strip()
+        if not func_name:
+            raise ValueError("Blank function name in Qwen tool call")
+
+        args = _parse_parameters(match.group(2), func_name)
+        results.append(
+            ToolCall(
+                function=Tool(
+                    name=func_name,
+                    arguments=json.dumps(args, ensure_ascii=False),
+                )
+            )
+        )
+        cursor = match.end()
+
+    if not results:
+        raise ValueError("Qwen tool output did not contain a complete function call")
+    return results
 
 
 def parse_toolcalls(text: str) -> list[ToolCall]:
-    # If there are outer <tool_call> wrappers, unwrap them; otherwise use the whole text
-    segments: list[tuple[str, str]] = []  # (raw, inner)
-    outer_matches = list(_OUTER.finditer(text))
-    if outer_matches:
-        is_wrapped = False
-        for m in outer_matches:
-            segments.append((m.group(0), m.group(1)))
+    if not text.strip():
+        return []
+
+    # The outer wrapper is optional, but a batch must use one form consistently.
+    stripped = text.lstrip()
+    is_wrapped = stripped.startswith("<tool_call") or stripped.startswith(
+        "</tool_call>"
+    )
+
+    results: list[ToolCall] = []
+    if is_wrapped:
+        cursor = 0
+        while cursor < len(text):
+            match = _OUTER.match(text, cursor)
+            if match is None:
+                if text[cursor:].strip():
+                    raise ValueError("Malformed or unmatched Qwen tool_call wrapper")
+                break
+            results.extend(_parse_functions(match.group(1)))
+            cursor = match.end()
     else:
-        # No outer wrapper — look for bare <function=...> blocks
-        is_wrapped = True
-        segments = [(text, text)]
+        results = _parse_functions(text)
 
-    results = []
-    for _, inner in segments:
-        for fm in _FUNC.finditer(inner):
-            func_name = fm.group(1)
-            func_body = fm.group(2)
-            args: dict[str, any] = {}
-            for pm in _PARAM.finditer(func_body):
-                key = pm.group(1).strip()
-                val = pm.group(2).strip()
-                val = coerce_param_value(val)
-                args[key] = val
-
-            args_json = json.dumps(args, ensure_ascii=False)
-            results.append(ToolCall(function=Tool(name=func_name, arguments=args_json)))
+    if not results:
+        raise ValueError("Qwen tool output did not contain a complete tool call")
 
     xlogger.debug(
         f"qwen3_coder: Parsed {len(results)} tool calls",

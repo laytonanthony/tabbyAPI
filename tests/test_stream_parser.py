@@ -461,8 +461,9 @@ class GlimmerToolcallFormatTests(unittest.TestCase):
         self.assertEqual(calls[0].function.name, "list_files")
         self.assertEqual(calls[0].function.arguments, "{}")
 
-    def test_no_invoke_block(self):
-        self.assertEqual(self.parse(" to=ns.f<|message|>garbled<|eom|>"), [])
+    def test_no_invoke_block_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse(" to=ns.f<|message|>garbled<|eom|>")
 
 
 class HarmonyToolcallFormatTests(unittest.TestCase):
@@ -488,15 +489,16 @@ class HarmonyToolcallFormatTests(unittest.TestCase):
         self.assertEqual(calls[0].function.name, "f")
         self.assertEqual(calls[0].function.arguments, "{}")
 
-    def test_invalid_json_passed_through(self):
-        calls = self.parse(
-            '<|channel|>commentary to=functions.f <|constrain|>json<|message|>{"a": <|call|>'
-        )
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].function.arguments, '{"a":')
+    def test_invalid_json_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse(
+                '<|channel|>commentary to=functions.f <|constrain|>json'
+                '<|message|>{"a": <|call|>'
+            )
 
-    def test_no_recipient_no_call(self):
-        self.assertEqual(self.parse("<|channel|>commentary<|message|>preamble<|call|>"), [])
+    def test_no_recipient_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse("<|channel|>commentary<|message|>preamble<|call|>")
 
 
 class Hy3ToolcallFormatTests(unittest.TestCase):
@@ -560,6 +562,27 @@ class Hy3ToolcallFormatTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "list_files")
         self.assertEqual(calls[0].function.arguments, "{}")
+
+    def test_dangling_argument_key_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse(
+                "<tool_calls:opensource>"
+                "<tool_call:opensource>f<tool_sep:opensource>"
+                "<arg_key:opensource>cmd</arg_key:opensource>"
+                "</tool_call:opensource>"
+                "</tool_calls:opensource>"
+            )
+
+    def test_misordered_arguments_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse(
+                "<tool_calls:opensource>"
+                "<tool_call:opensource>f<tool_sep:opensource>"
+                "<arg_value:opensource>x</arg_value:opensource>"
+                "<arg_key:opensource>cmd</arg_key:opensource>"
+                "</tool_call:opensource>"
+                "</tool_calls:opensource>"
+            )
 
     def test_streamed_through_tag_parser(self):
         from endpoints.OAI.utils.toolcall_formats.hy3 import (
@@ -633,6 +656,18 @@ class LagunaToolcallFormatTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "list_files")
         self.assertEqual(calls[0].function.arguments, "{}")
+
+    def test_dangling_argument_key_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse("<tool_call>f<arg_key>cmd</arg_key></tool_call>")
+
+    def test_misordered_arguments_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse(
+                "<tool_call>f"
+                "<arg_value>x</arg_value><arg_key>cmd</arg_key>"
+                "</tool_call>"
+            )
 
     def test_streamed_through_tag_parser(self):
         p = TagStreamParser(

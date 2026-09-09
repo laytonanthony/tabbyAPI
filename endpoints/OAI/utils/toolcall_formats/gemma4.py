@@ -24,6 +24,19 @@ _STRING_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"|<\|"\|>(.*?)<\|"\|>', 
 _KEY_PATTERN = re.compile(r"([a-zA-Z0-9_]+)\s*:")
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"gemma4: Duplicate argument name {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_constant(value: str):
+    raise ValueError(f"gemma4: Non-standard JSON constant {value!r}")
+
+
 def _gemma_to_json(raw_args: str) -> dict:
     if not raw_args or not raw_args.strip():
         return {}
@@ -57,17 +70,39 @@ def _gemma_to_json(raw_args: str) -> dict:
 
     # 5. Native parse (acts as structural validation + converts true/false/null safely)
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        xlogger.debug("gemma4: JSON decoding failed for raw args", {"text": text, "error": str(e)})
-        return {}
+        arguments = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonstandard_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        xlogger.warning(
+            "gemma4: Invalid tool call arguments",
+            {"text": text, "exception": str(exc)},
+        )
+        raise ValueError("gemma4: Tool call arguments are malformed") from exc
+
+    if not isinstance(arguments, dict):
+        raise ValueError("gemma4: Tool call arguments must be a JSON object")
+    return arguments
 
 
 def parse_toolcalls(text: str) -> list[ToolCall]:
+    start_count = text.count(TOOLCALL_START)
+    end_count = text.count(TOOLCALL_END)
+    if not start_count and not end_count:
+        return []
+
+    matches = list(_CALL_PATTERN.finditer(text))
+    if start_count != end_count or len(matches) != start_count:
+        raise ValueError("gemma4: Incomplete or malformed tool call batch")
+
     results = []
 
-    for m in _CALL_PATTERN.finditer(text):
-        func_name = m.group(1)
+    for m in matches:
+        func_name = m.group(1).strip()
+        if not func_name:
+            raise ValueError("gemma4: Tool call has no function name")
         raw_args = m.group(2)
 
         args_dict = _gemma_to_json(raw_args)

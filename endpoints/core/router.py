@@ -3,10 +3,10 @@ import pathlib
 from typing import Optional
 from common.multimodal import MultimodalEmbeddingWrapper
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from sse_starlette import EventSourceResponse
 
-from common import model, sampling
+from common import model, sampling, zeta_metrics
 from common.auth import check_admin_key, check_api_key, get_key_permission
 from common.downloader import hf_repo_download
 from common.model import check_embeddings_container, check_model_container
@@ -56,6 +56,15 @@ from endpoints.core.utils.model import (
 
 
 router = APIRouter()
+
+
+@router.get("/metrics", response_class=PlainTextResponse)
+async def zeta_inference_metrics() -> PlainTextResponse:
+    """Expose live local inference counters for Zeta's system monitor."""
+    return PlainTextResponse(
+        zeta_metrics.prometheus_text(),
+        media_type="text/plain; version=0.0.4",
+    )
 
 
 # Healthcheck endpoint
@@ -427,7 +436,7 @@ async def encode_tokens(data: TokenEncodeRequest) -> TokenEncodeResponse:
 
         template_vars = {
             **(data.template_vars or {}),
-            "add_generation_prompt": False,
+            "add_generation_prompt": data.add_generation_prompt,
         }
 
         text, mm_embeddings, rendered_template_vars = await format_messages_with_template(

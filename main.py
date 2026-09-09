@@ -24,13 +24,18 @@ from common.tabby_config import config
 
 
 async def entrypoint_async():
-    from common import model
+    from common import model, zeta_metrics
     from endpoints.server import start_api
 
     """Async entry function for program startup"""
 
     host = config.network.host
     port = config.network.port
+
+    # Serve Zeta's live inference counters from an independent thread so the
+    # hardware monitor remains responsive while ExLlamaV3 is occupying the
+    # main API event loop with generation work.
+    zeta_metrics.start_server()
 
     # Check if the port is available and attempt to bind a fallback
     if is_port_in_use(port):
