@@ -82,7 +82,7 @@ class TestCatalogueMembership(unittest.TestCase):
             [],
         )
 
-    def test_offline_disabled_inactive_and_presets_are_excluded(self):
+    def test_offline_opt_out_inactive_and_presets_are_excluded(self):
         records = [
             model("disabled", config={"enabled": False}),
             model("inactive", active=False, config={"enabled": True}),
@@ -94,7 +94,7 @@ class TestCatalogueMembership(unittest.TestCase):
             [],
         )
 
-    def test_exact_live_models_follow_responses_even_if_registry_inactive(self):
+    def test_exact_live_models_still_require_enabled_registry_rows(self):
         records = [
             model("disabled", config={"enabled": False}),
             model("inactive", active=False, config={"enabled": False}),
@@ -105,8 +105,48 @@ class TestCatalogueMembership(unittest.TestCase):
             records, live_model_ids=["disabled", "inactive", "preset"]
         )
 
+        self.assertEqual([item["id"] for item in result], ["disabled", "preset"])
+
+    def test_active_preset_cannot_bypass_disabled_registered_base(self):
+        records = [
+            model("paid-base", active=False, config={"enabled": True}),
+            model(
+                "friendly-preset",
+                active=True,
+                base_model_id="paid-base",
+                config={"enabled": True},
+            ),
+        ]
+
+        result = catalog.build_catalogue_models(
+            records,
+            live_model_ids=["paid-base", "friendly-preset"],
+        )
+
+        self.assertEqual(result, [])
+
+    def test_unregistered_provider_base_does_not_disable_active_preset(self):
+        preset = model(
+            "friendly-preset",
+            active=True,
+            base_model_id="provider-only-id",
+        )
+
+        result = catalog.build_catalogue_models(
+            [preset], live_model_ids=["friendly-preset"]
+        )
+
+        self.assertEqual([item["id"] for item in result], ["friendly-preset"])
+
+    def test_malformed_base_cycle_is_conservatively_unavailable(self):
+        records = [
+            model("cycle-a", base_model_id="cycle-b"),
+            model("cycle-b", base_model_id="cycle-a"),
+        ]
+
         self.assertEqual(
-            [item["id"] for item in result], ["disabled", "inactive", "preset"]
+            catalog.unavailable_registered_model_ids(records),
+            {"cycle-a", "cycle-b"},
         )
 
     def test_unsafe_internal_ids_are_excluded(self):
@@ -439,6 +479,92 @@ class TestCatalogueStatusMerge(unittest.TestCase):
         )
 
         self.assertEqual([item["id"] for item in result], ["Model-X", "model-x"])
+
+    def test_disabled_models_are_omitted_not_reported_offline(self):
+        existing = [
+            {"id": "paid", "state": "online", "online": True, "loaded": False},
+            {"id": "local", "state": "online", "online": True, "loaded": True},
+        ]
+
+        result = catalog.merge_catalogue_status(
+            existing,
+            [{"id": "paid"}, {"id": "offline-enabled"}],
+            disabled_model_ids={"paid"},
+        )
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "id": "local",
+                    "state": "online",
+                    "online": True,
+                    "loaded": True,
+                },
+                {
+                    "id": "offline-enabled",
+                    "state": "offline",
+                    "online": False,
+                    "loaded": False,
+                    "source": "unknown",
+                },
+            ],
+        )
+
+
+class TestOpenAIModelFiltering(unittest.TestCase):
+    def test_filter_removes_direct_and_base_chain_disabled_ids_without_mutation(self):
+        response = {
+            "object": "list",
+            "data": [
+                {"id": "paid-base", "urlIdx": 1},
+                {"id": "paid-preset", "urlIdx": 1},
+                {"id": "local", "urlIdx": 0},
+                {"id": "provider-only", "urlIdx": 2},
+                "paid-base",
+                {"name": "paid-preset"},
+            ],
+        }
+        records = [
+            model("paid-base", active=False),
+            model("paid-preset", base_model_id="paid-base"),
+            model("local"),
+        ]
+        before = copy.deepcopy(response)
+
+        result = catalog.filter_inactive_model_response(response, records)
+
+        self.assertEqual(
+            [item["id"] for item in result["data"]],
+            ["local", "provider-only"],
+        )
+        self.assertEqual(response, before)
+        self.assertEqual(result["object"], "list")
+
+    def test_string_and_name_only_provider_entries_are_filtered(self):
+        records = [model("paid", active=False), model("local", active=True)]
+
+        result = catalog.filter_inactive_model_response(
+            {
+                "data": [
+                    "paid",
+                    "local",
+                    {"name": "paid"},
+                    {"name": "local"},
+                ]
+            },
+            records,
+        )
+
+        self.assertEqual(result["data"], ["local", {"name": "local"}])
+
+    def test_active_and_reenabled_ids_are_available(self):
+        records = [
+            model("local", active=True),
+            model("preset", active=True, base_model_id="local"),
+        ]
+
+        self.assertEqual(catalog.unavailable_registered_model_ids(records), set())
 
 
 if __name__ == "__main__":

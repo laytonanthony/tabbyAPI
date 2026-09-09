@@ -26,6 +26,7 @@ from open_webui.utils.zeta_model_catalog import (
     if_none_match_matches,
     is_catalogue_member,
     merge_catalogue_status,
+    unavailable_registered_model_ids,
     response_headers,
 )
 
@@ -55,18 +56,20 @@ def _live_ids(response: dict) -> set[str]:
 
 def _authorised_registry_models(
     *,
+    registry_models: list,
     user: UserModel,
     live_model_ids: Iterable[str],
     db: Session | None,
-) -> tuple[list, set[str]]:
-    registry_models = Models.get_all_models(db=db)
+) -> tuple[list, set[str], set[str]]:
     registered_model_ids = {
         model.id for model in registry_models if isinstance(model.id, str)
     }
+    unavailable_model_ids = unavailable_registered_model_ids(registry_models)
     candidates = [
         model
         for model in registry_models
-        if is_catalogue_member(model, live_model_ids)
+        if model.id not in unavailable_model_ids
+        and is_catalogue_member(model, live_model_ids)
     ]
 
     # This mirrors the Responses endpoint: admins and installations that
@@ -95,6 +98,7 @@ def _authorised_registry_models(
             granted_model_ids=granted_ids,
         ),
         registered_model_ids,
+        unavailable_model_ids,
     )
 
 
@@ -134,6 +138,48 @@ def _append_unregistered_live_models(
     return result
 
 
+async def catalogue_state_for_user(
+    request: Request,
+    user: UserModel,
+    *,
+    db: Session | None = None,
+    live_model_ids: Iterable[str] | None = None,
+) -> tuple[list[dict], set[str]]:
+    """Build catalogue and disabled IDs from one authoritative registry read."""
+
+    if live_model_ids is None:
+        discovered = await openai.get_all_models(request, user=user)
+        live_model_ids = _live_ids(discovered)
+    else:
+        live_model_ids = set(live_model_ids)
+
+    # A fresh, single snapshot makes an enable/disable toggle atomic from the
+    # status endpoint's perspective and avoids duplicating grant lookups.
+    registry_snapshot = Models.get_all_models(db=db)
+    registry_models, registered_model_ids, unavailable_model_ids = (
+        _authorised_registry_models(
+            registry_models=registry_snapshot,
+            user=user,
+            live_model_ids=live_model_ids,
+            db=db,
+        )
+    )
+    registry_models = _append_unregistered_live_models(
+        registry_models,
+        live_model_ids=live_model_ids,
+        registered_model_ids=registered_model_ids,
+        user=user,
+    )
+    return (
+        build_catalogue_models(
+            registry_models,
+            live_model_ids=live_model_ids,
+            model_order_list=request.app.state.config.MODEL_ORDER_LIST or [],
+        ),
+        unavailable_model_ids,
+    )
+
+
 async def catalogue_for_user(
     request: Request,
     user: UserModel,
@@ -143,28 +189,13 @@ async def catalogue_for_user(
 ) -> list[dict]:
     """Build the current user's catalogue without exposing registry objects."""
 
-    if live_model_ids is None:
-        discovered = await openai.get_all_models(request, user=user)
-        live_model_ids = _live_ids(discovered)
-    else:
-        live_model_ids = set(live_model_ids)
-
-    registry_models, registered_model_ids = _authorised_registry_models(
-        user=user,
-        live_model_ids=live_model_ids,
+    models, _ = await catalogue_state_for_user(
+        request,
+        user,
         db=db,
-    )
-    registry_models = _append_unregistered_live_models(
-        registry_models,
         live_model_ids=live_model_ids,
-        registered_model_ids=registered_model_ids,
-        user=user,
     )
-    return build_catalogue_models(
-        registry_models,
-        live_model_ids=live_model_ids,
-        model_order_list=request.app.state.config.MODEL_ORDER_LIST or [],
-    )
+    return models
 
 
 @router.get("/catalog")

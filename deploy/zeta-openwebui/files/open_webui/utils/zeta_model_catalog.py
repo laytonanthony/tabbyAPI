@@ -125,25 +125,89 @@ def is_safe_model_id(value: Any) -> bool:
 def is_catalogue_member(model: Any, live_model_ids: Iterable[str] = ()) -> bool:
     """Return whether a registry row belongs to the Responses catalogue.
 
-    An exactly matched live model is routable by Responses and therefore wins
-    over registry lifecycle/opt-in metadata. Explicitly enabled, active base
-    rows persist while offline.
+    OpenWebUI's existing ``is_active`` switch is authoritative: disabled rows
+    are absent even when an upstream provider still advertises their IDs.
+    Exactly matched *enabled* live models are discovered automatically, while
+    explicitly opted-in enabled base rows persist when their provider is
+    offline.
     """
 
     model_id = _field(model, "id")
     if not is_safe_model_id(model_id):
         return False
+    if _field(model, "is_active", False) is not True:
+        return False
+
     live_lookup = {
         candidate for candidate in live_model_ids if isinstance(candidate, str)
     }
     if model_id in live_lookup:
         return True
 
-    if _field(model, "is_active", False) is not True:
-        return False
     if _field(model, "base_model_id") is not None:
         return False
     return catalogue_config(model).get("enabled") is True
+
+
+def unavailable_registered_model_ids(models: Iterable[Any]) -> set[str]:
+    """Return registered IDs disabled directly or through a base-model chain.
+
+    An active preset must not provide a route around a disabled paid base
+    model. Missing (provider-only) bases remain valid, while a malformed cycle
+    is conservatively unavailable.
+    """
+
+    records = {
+        model_id: model
+        for model in models
+        if isinstance(model_id := _field(model, "id"), str) and model_id
+    }
+    unavailable: set[str] = set()
+    for model_id in records:
+        visited: set[str] = set()
+        current_id: str | None = model_id
+        while current_id in records:
+            if current_id in visited:
+                unavailable.add(model_id)
+                break
+            visited.add(current_id)
+            current = records[current_id]
+            if _field(current, "is_active") is not True:
+                unavailable.add(model_id)
+                break
+            base_model_id = _field(current, "base_model_id")
+            current_id = base_model_id if isinstance(base_model_id, str) else None
+    return unavailable
+
+
+def filter_inactive_model_response(
+    response: Mapping[str, Any],
+    registry_models: Iterable[Any],
+) -> dict[str, Any]:
+    """Remove disabled registered IDs from an OpenAI model-list response.
+
+    Provider-only IDs remain untouched.  The returned mapping and data list
+    are copies so cached raw discovery remains available to catalogue/status
+    code without being mutated.
+    """
+
+    result = dict(response)
+    data = response.get("data")
+    if not isinstance(data, list):
+        return result
+
+    disabled_ids = unavailable_registered_model_ids(registry_models)
+
+    def model_id(value: Any) -> str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, Mapping):
+            candidate = value.get("id") or value.get("name")
+            return candidate if isinstance(candidate, str) else None
+        return None
+
+    result["data"] = [model for model in data if model_id(model) not in disabled_ids]
+    return result
 
 
 def _clean_public_text(value: Any, maximum: int) -> str | None:
@@ -291,7 +355,9 @@ def build_catalogue_models(
     live_model_ids: Iterable[str] = (),
     model_order_list: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
+    models = list(models)
     live_model_ids = tuple(live_model_ids)
+    unavailable_ids = unavailable_registered_model_ids(models)
     model_order = {
         model_id: index
         for index, model_id in enumerate(model_order_list)
@@ -300,6 +366,8 @@ def build_catalogue_models(
     result = []
     seen = set()
     for model in models:
+        if _field(model, "id") in unavailable_ids:
+            continue
         if not is_catalogue_member(model, live_model_ids):
             continue
         normalised = normalise_catalogue_model(model, model_order=model_order)
@@ -346,10 +414,27 @@ def filter_authorised_models(
 def merge_catalogue_status(
     status_items: Sequence[Mapping[str, Any]],
     catalogue_models: Sequence[Mapping[str, Any]],
+    *,
+    disabled_model_ids: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
-    """Append explicit offline state without changing existing status items."""
+    """Omit disabled IDs and append explicit offline catalogue state.
 
-    result = [dict(item) for item in status_items]
+    Enabled live status entries retain every existing field. Disabled models
+    are intentionally absent rather than represented as offline: disabling is
+    an administrative catalogue/routing decision, while offline is a runtime
+    availability state for an enabled model.
+    """
+
+    disabled_ids = {
+        model_id for model_id in disabled_model_ids if isinstance(model_id, str)
+    }
+    result = [
+        dict(item)
+        for item in status_items
+        if not (
+            isinstance(item.get("id"), str) and item.get("id") in disabled_ids
+        )
+    ]
     represented_ids = {
         item.get("id")
         for item in result
@@ -357,7 +442,11 @@ def merge_catalogue_status(
     }
     for catalogue_model in catalogue_models:
         model_id = catalogue_model.get("id")
-        if not isinstance(model_id, str) or model_id in represented_ids:
+        if (
+            not isinstance(model_id, str)
+            or model_id in represented_ids
+            or model_id in disabled_ids
+        ):
             continue
         represented_ids.add(model_id)
         result.append(

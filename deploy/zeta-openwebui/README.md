@@ -1,8 +1,10 @@
 # Zeta desktop model catalogue
 
-This overlay adds a read-only, authenticated model catalogue to the Zeta
-OpenWebUI deployment without changing the OpenAI-compatible model list or
-Responses routing.
+This overlay adds an authenticated model catalogue and web-based catalogue
+metadata editor to the Zeta OpenWebUI deployment. The existing OpenWebUI
+model `Enabled` switch is also enforced consistently by the OpenAI-compatible
+model list and execution routes, so disabling a paid provider model removes
+it from Zeta and prevents outbound use.
 
 ## Architecture and source of truth
 
@@ -13,15 +15,19 @@ copy provider addresses into a public response.
 
 Membership has two paths:
 
-1. A registry row whose exact ID is currently advertised by the OpenAI model
-   discovery used by `/openai/responses` appears automatically, even if the
-   row is inactive or has catalogue metadata disabled. Live Responses
-   routability is authoritative; normal owner/read-grant checks still apply.
+1. An enabled registry row whose exact ID is currently advertised by the
+   OpenAI model discovery used by `/openai/responses` appears automatically,
+   even if optional catalogue metadata is absent. Normal owner/read-grant
+   checks still apply.
 2. An active base-model row with `meta.zeta_catalog.enabled: true` remains in
    the catalogue when it is offline and absent from live discovery.
 
 For offline persistence, `meta.zeta_catalog.enabled: false` or a missing opt-in
-excludes the row; inactive and preset rows are also excluded while offline.
+excludes the row; presets are also excluded while offline. A model whose
+normal OpenWebUI `is_active` value is false is always excluded, even if its
+provider still advertises it or `meta.zeta_catalog.enabled` is true. An active
+preset is also excluded when its registered base-model chain contains a
+disabled row, preventing aliases from bypassing a disabled paid service.
 Unsafe/path-like IDs are always excluded. This avoids mixing Ollama,
 image/video, and local-path records into the Responses catalogue. Ordinary
 users also require a registered row because
@@ -34,6 +40,38 @@ provider stops advertising them.
 The opt-in is an operator contract: the row's `id` must be exactly the ID the
 Responses provider advertises when online. Availability is never stored in
 the catalogue. `/api/v1/models/status` remains the availability source.
+
+### Enablement versus offline retention
+
+The two controls intentionally mean different things:
+
+- **Model Enabled** (`is_active`) is the global administrative switch. When
+  off, the model is omitted from `/api/v1/models/catalog`, `/openai/models`,
+  and `/api/v1/models/status`. Chat Completions, Responses, Responses input
+  tokens, embeddings, context token count, speech payloads, and generic
+  model-routed OpenAI proxy calls reject the ID with the same `404 Model not
+  found` response as an unknown model. This applies to administrators and
+  internal calls as well as ordinary users. The generic catch-all proxy can
+  enforce the switch when its request is JSON and carries a top-level
+  `model`; multipart endpoints cannot be mapped reliably by this model-row
+  control.
+- **Keep in catalogue while provider is offline**
+  (`meta.zeta_catalog.enabled`) applies only while the normal model switch is
+  on. It lets the desktop keep an enabled-but-unavailable model visible and
+  grey it using the status endpoint.
+
+Registry checks happen before opening an outbound provider session. A model
+registry failure returns a generic `503` rather than failing open. Raw cached
+provider discovery remains unchanged internally; filtering is applied to a
+copy at the public `/openai/models` boundary.
+
+For a provider-wide emergency or billing stop, disable the OpenAI-compatible
+**connection** itself in Connections settings. That is the authoritative kill
+switch for every endpoint on the provider, including model-less, batch,
+multipart, and direct-connection traffic that cannot be attributed to one
+OpenWebUI model row. The per-model switch fully covers the JSON DeepSeek/Zeta
+chat and Responses paths described above, but is not a substitute for turning
+off an entire provider connection.
 
 ## Endpoint and authentication
 
@@ -116,8 +154,9 @@ headers, environment variables, filesystem paths, prompts, `params`,
 ## Configuring metadata and adding a model
 
 Add or update the normal OpenWebUI model record through the existing admin
-model-management flow. Put desktop-safe metadata beneath the existing
-extensible `meta.zeta_catalog` field:
+model-management flow. The per-model editor includes a **Zeta Desktop
+Catalogue** section for these fields, stored beneath the existing extensible
+`meta.zeta_catalog` object:
 
 ```json
 {
@@ -144,10 +183,11 @@ To add a model safely:
 
 1. Configure its provider/routing through the existing Zeta/OpenWebUI
    process; do not add backend data to this overlay.
-2. Create or update its active base-model row. Use the exact provider model
-   ID and configure the normal owner/read grants.
-3. Add `meta.zeta_catalog.enabled: true` and any known metadata above. This
-   keeps the record visible while its provider is stopped.
+2. Create or update its base-model row. Use the exact provider model ID,
+   configure the normal owner/read grants, and leave the model **Enabled**.
+3. In **Zeta Desktop Catalogue**, turn on **Keep in catalogue while provider
+   is offline** and fill any known metadata. This keeps the enabled record
+   visible while its provider is stopped.
 4. Verify the ID appears in `/openai/models` while online and that a benign
    `/openai/responses/input_tokens` request recognizes it.
 5. Verify `/api/v1/models/catalog` as the intended user's API key and join it
@@ -185,6 +225,12 @@ The desktop must join on exact ID and must not send a request to a model whose
 status is offline. `online: null` retains the status endpoint's existing
 meaning for a statically advertised model whose provider state is unknown.
 
+A disabled model is not an offline model: it is omitted from both catalogue
+and status responses and cannot be invoked. Re-enabling it makes it eligible
+for discovery immediately; if it is configured for offline retention but the
+provider is unavailable, it then appears in the catalogue with the offline
+status above.
+
 Example catalogue response:
 
 ```json
@@ -218,10 +264,7 @@ Example catalogue response:
 ## Desktop integration assumptions
 
 This server endpoint intentionally does not return Codex prompts or execution
-policy. The current desktop catalogue format uses `slug`, structured
-reasoning objects, and trusted local fields such as base instructions, shell
-type, patch-tool type, truncation, reasoning-summary defaults, and effective
-context percentage. A later desktop adapter must:
+policy. The desktop adapter must:
 
 - map server `id` to the Codex `slug`;
 - expand reasoning-level strings into the local format;
@@ -231,8 +274,10 @@ context percentage. A later desktop adapter must:
 - join status by exact ID and grey out offline/unknown models;
 - never turn server text into system prompts or execution policy.
 
-Until that adapter exists, this endpoint does not alter the desktop's current
-static catalogue. No Windows or Codex files are part of this overlay.
+No Windows or Codex files are part of this overlay. The desktop should remove
+a model when it disappears from a successfully refreshed catalogue, and use
+the separate status response only to grey enabled catalogue members that are
+offline or unknown.
 
 ## Deployment and rollback
 
@@ -249,17 +294,19 @@ python deploy/zeta-openwebui/install.py \
 
 The installer:
 
-- validates the reviewed `main.py` base hash (or recognizes an existing
-  complete installation);
+- validates the reviewed `main.py`, `openai.py`, and model-editor source hashes
+  (or recognizes an existing complete installation);
 - compiles all Python before writing;
 - creates a timestamped backup beneath
   `backend/.zeta-backups/model-catalog-<UTC timestamp>`;
-- atomically writes two overlay modules and marked `main.py` integrations;
+- atomically writes the overlay modules and marked backend/frontend
+  integrations;
 - is idempotent and copies no database, config, key, or environment data.
 
-After installation, run the focused tests, wait for active requests to drain,
-restart only OpenWebUI, and verify health/auth/catalogue/status. To roll back,
-stop OpenWebUI, restore `main.py` from the reported backup, remove the two
-overlay modules if they did not exist in that backup, and restart OpenWebUI.
-A maintained Zeta OpenWebUI fork is the preferred long-term replacement for
-this overlay packaging.
+After installation, build the OpenWebUI frontend, run the focused tests, wait
+for active requests to drain, restart only OpenWebUI, and verify
+health/auth/catalogue/status plus a disabled-model rejection. To roll back,
+stop OpenWebUI, restore every file from the reported backup, remove newly
+created overlay files that have no backup copy, rebuild the frontend, and
+restart OpenWebUI. A maintained Zeta OpenWebUI fork is the preferred long-term
+replacement for this overlay packaging.

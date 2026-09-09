@@ -147,7 +147,7 @@ class TestCatalogueRoute(unittest.TestCase):
     @patch.object(route_module.AccessGrants, "get_accessible_resource_ids")
     @patch.object(route_module.Groups, "get_groups_by_member_id", return_value=[])
     @patch.object(route_module.Models, "get_all_models")
-    def test_live_inactive_registry_row_follows_responses_access(
+    def test_live_inactive_registry_row_is_absent_for_authorised_user(
         self, get_models, _groups, get_grants, discovery
     ):
         get_models.return_value = [
@@ -163,10 +163,34 @@ class TestCatalogueRoute(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            [item["id"] for item in response.json()["models"]],
-            ["live-inactive"],
-        )
+        self.assertEqual(response.json()["models"], [])
+        get_models.assert_called_once()
+
+    @patch.object(route_module.openai, "get_all_models", new_callable=AsyncMock)
+    @patch.object(route_module.AccessGrants, "get_accessible_resource_ids")
+    @patch.object(route_module.Groups, "get_groups_by_member_id", return_value=[])
+    @patch.object(route_module.Models, "get_all_models")
+    def test_active_live_preset_cannot_bypass_disabled_base(
+        self, get_models, _groups, get_grants, discovery
+    ):
+        base = registry_model("paid-base", "owner", active=False)
+        preset = registry_model("paid-preset", "owner", active=True)
+        preset.base_model_id = "paid-base"
+        get_models.return_value = [base, preset]
+        discovery.return_value = {
+            "data": [{"id": "paid-base"}, {"id": "paid-preset"}]
+        }
+        get_grants.return_value = {"paid-base", "paid-preset"}
+
+        with patch.object(route_module, "BYPASS_MODEL_ACCESS_CONTROL", False):
+            response = self.client.get(
+                "/api/v1/models/catalog",
+                headers={"Authorization": "Bearer key-a"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["models"], [])
+        get_models.assert_called_once()
 
     @patch.object(route_module, "catalogue_for_user", new_callable=AsyncMock)
     def test_etag_returns_empty_304_and_private_cache_headers(self, catalogue_for_user):
