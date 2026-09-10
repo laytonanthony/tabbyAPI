@@ -17,6 +17,7 @@ import base64
 import binascii
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -49,7 +50,7 @@ STORE_MARKER_BYTES = b"zeta-desktop-update-store-v1\n"
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_SUMMARY_BYTES = 256 * 1024
 MAX_SIGNATURE_BYTES = 16 * 1024
-MAX_INSTALLER_BYTES = 64 * 1024 * 1024 * 1024
+MAX_INSTALLER_BYTES = 8 * 1024 * 1024 * 1024
 MIN_RSA_BITS = 2048
 
 DEFAULT_RELEASE_ROOT = Path("/home/anthony/.local/share/zeta/desktop-updates")
@@ -71,6 +72,31 @@ _SEMVER = re.compile(
     r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*"
     r"))?"
     r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z"
+)
+_PUBLISHED_AT = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt]"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?"
+    r"(?:[Zz]|[+-][0-9]{2}:[0-9]{2})\Z"
+)
+_THUMBPRINT = re.compile(r"(?:[A-F0-9]{40}|[A-F0-9]{64})\Z")
+
+_MANIFEST_REQUIRED_FIELDS = frozenset(
+    {
+        "schemaVersion",
+        "product",
+        "channel",
+        "version",
+        "publishedAt",
+        "minimumSupportedVersion",
+        "mandatory",
+        "installer",
+    }
+)
+_MANIFEST_ALLOWED_FIELDS = _MANIFEST_REQUIRED_FIELDS | {"releaseNotes"}
+_INSTALLER_REQUIRED_FIELDS = frozenset({"url", "size", "sha256"})
+_INSTALLER_ALLOWED_FIELDS = _INSTALLER_REQUIRED_FIELDS | {"authenticode"}
+_AUTHENTICODE_FIELDS = frozenset(
+    {"publisherSubject", "certificateThumbprint"}
 )
 
 
@@ -321,16 +347,37 @@ def _require_text(value: object, *, field: str, limit: int = 256) -> str:
     return value
 
 
-def _validate_filename(value: object) -> str:
-    filename = _require_text(value, field="installer.filename", limit=128)
+def _require_exact_fields(
+    value: Mapping[str, Any],
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str],
+    field: str,
+) -> None:
+    present = set(value)
+    unknown = sorted(present - allowed)
+    if unknown:
+        raise UpdateValidationError(f"{field} contains unknown property {unknown[0]!r}")
+    missing = sorted(required - present)
+    if missing:
+        raise UpdateValidationError(f"{field} is missing required property {missing[0]!r}")
+
+
+def _validate_derived_filename(value: str) -> str:
+    filename = _require_text(value, field="installer URL filename", limit=128)
     if _SAFE_FILENAME.fullmatch(filename) is None or filename in {".", ".."}:
-        raise UpdateValidationError("installer.filename is not a safe file name")
+        raise UpdateValidationError("installer URL filename is not a safe file name")
     return filename
 
 
-def _validate_https_url(value: object, filename: str) -> str:
+def _validate_https_url(value: object) -> tuple[str, str]:
     url = _require_text(value, field="installer.url", limit=2048)
-    if any(character.isspace() for character in url) or "\\" in url:
+    if (
+        any(character.isspace() for character in url)
+        or "\\" in url
+        or "?" in url
+        or "#" in url
+    ):
         raise UpdateValidationError("installer.url contains unsafe characters")
     try:
         parsed = urlsplit(url)
@@ -355,11 +402,53 @@ def _validate_https_url(value: object, filename: str) -> str:
     segments = parsed.path.split("/")[1:]
     if not segments or any(not segment or segment in {".", ".."} for segment in segments):
         raise UpdateValidationError("installer.url path is unsafe")
-    if segments[-1] != filename:
-        raise UpdateValidationError("installer.url must end with installer.filename")
     if any(_SAFE_FILENAME.fullmatch(segment) is None for segment in segments):
         raise UpdateValidationError("installer.url path contains unsafe characters")
-    return url
+    filename = _validate_derived_filename(segments[-1])
+    return url, filename
+
+
+def _validate_published_at(value: object) -> str:
+    published_at = _require_text(value, field="publishedAt", limit=64)
+    if _PUBLISHED_AT.fullmatch(published_at) is None:
+        raise UpdateValidationError("publishedAt must be an ISO-8601 timestamp")
+    normalized = (
+        f"{published_at[:-1]}+00:00"
+        if published_at.endswith(("Z", "z"))
+        else published_at
+    )
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise UpdateValidationError("publishedAt must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise UpdateValidationError("publishedAt must include a UTC offset")
+    return published_at
+
+
+def _validate_authenticode(value: object) -> None:
+    if not isinstance(value, dict):
+        raise UpdateValidationError("installer.authenticode must be a JSON object")
+    _require_exact_fields(
+        value,
+        allowed=_AUTHENTICODE_FIELDS,
+        required=_AUTHENTICODE_FIELDS,
+        field="installer.authenticode",
+    )
+    publisher = value.get("publisherSubject")
+    if (
+        not isinstance(publisher, str)
+        or not publisher.strip()
+        or len(publisher.strip()) > 512
+    ):
+        raise UpdateValidationError(
+            "installer.authenticode.publisherSubject must be nonempty text"
+        )
+    thumbprint = value.get("certificateThumbprint")
+    if not isinstance(thumbprint, str) or _THUMBPRINT.fullmatch(thumbprint) is None:
+        raise UpdateValidationError(
+            "installer.authenticode.certificateThumbprint must be 40 or 64 uppercase hexadecimal characters"
+        )
 
 
 def validate_manifest(
@@ -376,9 +465,15 @@ def validate_manifest(
     document = _json_object(
         exact_bytes, label=LATEST_FILENAME, limit=MAX_MANIFEST_BYTES
     )
-    schema_version = document.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != 1:
-        raise UpdateValidationError("schema_version must be integer 1")
+    _require_exact_fields(
+        document,
+        allowed=_MANIFEST_ALLOWED_FIELDS,
+        required=_MANIFEST_REQUIRED_FIELDS,
+        field="manifest",
+    )
+    schema_version = document.get("schemaVersion")
+    if type(schema_version) is not int or schema_version != 1:
+        raise UpdateValidationError("schemaVersion must be integer 1")
     product = _require_text(document.get("product"), field="product")
     channel = _require_text(document.get("channel"), field="channel")
     if product != expected_product:
@@ -386,15 +481,36 @@ def validate_manifest(
     if channel != expected_channel:
         raise UpdateValidationError("manifest channel does not match this store")
     version = SemVer.parse(document.get("version"))
+    _validate_published_at(document.get("publishedAt"))
+    minimum_supported_value = document.get("minimumSupportedVersion")
+    if minimum_supported_value is not None:
+        minimum_supported = SemVer.parse(minimum_supported_value)
+        if version < minimum_supported:
+            raise UpdateValidationError(
+                "minimumSupportedVersion cannot be newer than version"
+            )
+    if type(document.get("mandatory")) is not bool:
+        raise UpdateValidationError("mandatory must be a boolean")
+    if "releaseNotes" in document:
+        release_notes = document["releaseNotes"]
+        if not isinstance(release_notes, str) or len(release_notes) > 16_384:
+            raise UpdateValidationError(
+                "releaseNotes must be text no longer than 16,384 characters"
+            )
     installer_value = document.get("installer")
     if not isinstance(installer_value, dict):
         raise UpdateValidationError("installer must be a JSON object")
-    filename = _validate_filename(installer_value.get("filename"))
+    _require_exact_fields(
+        installer_value,
+        allowed=_INSTALLER_ALLOWED_FIELDS,
+        required=_INSTALLER_REQUIRED_FIELDS,
+        field="installer",
+    )
+    url, filename = _validate_https_url(installer_value.get("url"))
     if filename != f"Zeta-Setup-{version.text}.exe":
         raise UpdateValidationError(
-            "installer.filename must be Zeta-Setup-{version}.exe"
+            "installer.url must end with Zeta-Setup-{version}.exe"
         )
-    url = _validate_https_url(installer_value.get("url"), filename)
     size = installer_value.get("size")
     if (
         isinstance(size, bool)
@@ -409,6 +525,8 @@ def validate_manifest(
         or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
     ):
         raise UpdateValidationError("installer.sha256 must be lowercase SHA-256 hex")
+    if "authenticode" in installer_value:
+        _validate_authenticode(installer_value["authenticode"])
     return ValidatedManifest(
         document=document,
         exact_bytes=exact_bytes,

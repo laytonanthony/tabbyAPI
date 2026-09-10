@@ -322,17 +322,19 @@ paths, signature material, and exception text are not returned or logged.
 
 ### Manifest and publication contract
 
-`latest.json` is a bounded UTF-8 JSON object. These fields are required and
-are verified before publication:
+`latest.json` is a bounded UTF-8 JSON object. Its canonical Windows shape is:
 
 ```json
 {
-  "schema_version": 1,
+  "schemaVersion": 1,
   "product": "Zeta",
   "channel": "stable",
   "version": "1.2.3",
+  "publishedAt": "2026-09-10T12:00:00.0000000+00:00",
+  "minimumSupportedVersion": "1.0.0",
+  "mandatory": false,
+  "releaseNotes": "Plain-text release notes.",
   "installer": {
-    "filename": "Zeta-Setup-1.2.3.exe",
     "url": "https://www.zeta-ai.co.uk/api/desktop/updates/stable/Zeta-Setup-1.2.3.exe",
     "size": 12345678,
     "sha256": "lowercase-64-character-sha256"
@@ -340,9 +342,28 @@ are verified before publication:
 }
 ```
 
-`version` and the filename use strict Semantic Versioning. The URL must be
-credential-free HTTPS, have no query/fragment/path traversal, and end in the
-exact installer filename. Installer size and SHA-256 must match its bytes.
+The top-level allowlist is exactly `schemaVersion`, `product`, `channel`,
+`version`, `publishedAt`, `minimumSupportedVersion`, `mandatory`, optional
+`releaseNotes`, and `installer`. The installer allowlist is exactly `url`,
+`size`, `sha256`, and optional `authenticode`; `installer.filename` is not part
+of the signed Windows schema. All top-level fields except `releaseNotes` are
+required; `url`, `size`, and `sha256` are required inside `installer`.
+`schemaVersion` must be the integer `1` (the legacy `schema_version` spelling
+is rejected). `publishedAt` is an ISO-8601 timestamp no longer than 64
+characters,
+`minimumSupportedVersion` is a strict Semantic Version or `null`, `mandatory`
+is a boolean, and `releaseNotes` is bounded plain text.
+
+The release `version` uses strict Semantic Versioning. The URL is validated
+before its final path component is used as the internal installer filename. It
+must be an absolute, credential-free HTTPS URL with a hostname and no query,
+fragment, whitespace, backslash, percent-encoded path component, empty path
+component, `.` component, or `..` component. Its final component must equal
+exactly `Zeta-Setup-{version}.exe`. Installer size and SHA-256 must match its
+bytes. Optional `authenticode` contains only a non-empty `publisherSubject`
+(at most 512 characters) and an uppercase 40- or 64-character
+`certificateThumbprint`.
+
 The detached signature is canonical base64 text (optionally ending in one LF
 or CRLF) containing an RSA PKCS#1 v1.5/SHA-256 signature over the **exact
 manifest bytes**. The server contains only an RSA public key of at least 2048

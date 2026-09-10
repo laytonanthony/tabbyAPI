@@ -132,10 +132,28 @@ class DesktopUpdateRouteTests(unittest.TestCase):
 
         installer_sha256 = hashlib.sha256(installer_bytes).hexdigest()
         manifest = (
-            b'{\n  "product": "Zeta",\n  "channel": "stable",\n'
-            + f'  "version": "{version}"\n'.encode()
-            + b"}\n"
-        )
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "product": "Zeta",
+                    "channel": "stable",
+                    "version": version,
+                    "publishedAt": "2026-09-10T12:00:00.0000000+00:00",
+                    "minimumSupportedVersion": "1.0.0",
+                    "mandatory": False,
+                    "installer": {
+                        "url": (
+                            "https://updates.example.test/api/desktop/updates/"
+                            f"stable/{filename}"
+                        ),
+                        "size": len(installer_bytes),
+                        "sha256": installer_sha256,
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
+        ).encode()
         signature = b"Y2Fub25pY2FsLWJhc2U2NA==\r\n"
         return SimpleNamespace(
             version=version,
@@ -281,12 +299,15 @@ class DesktopUpdateRouteTests(unittest.TestCase):
         manifest = (
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schemaVersion": 1,
                     "product": "Zeta",
                     "channel": "stable",
                     "version": version,
+                    "publishedAt": "2026-09-10T12:00:00.0000000+00:00",
+                    "minimumSupportedVersion": "1.0.0",
+                    "mandatory": False,
+                    "releaseNotes": "Exact route-test bytes.",
                     "installer": {
-                        "filename": filename,
                         "url": (
                             "https://updates.example.test/api/desktop/updates/"
                             f"stable/{filename}"

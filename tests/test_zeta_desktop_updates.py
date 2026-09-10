@@ -64,6 +64,7 @@ PwIDAQAB
 -----END PUBLIC KEY-----
 """
 DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+DELETE = object()
 
 
 def sign_for_test(data: bytes) -> bytes:
@@ -109,12 +110,15 @@ class DesktopUpdateStoreTests(unittest.TestCase):
         installer = installer_directory / filename
         installer.write_bytes(installer_bytes)
         document = {
-            "schema_version": 1,
+            "schemaVersion": 1,
             "product": "Zeta",
             "channel": "stable",
             "version": version,
+            "publishedAt": "2026-09-10T12:00:00.0000000+00:00",
+            "minimumSupportedVersion": "1.0.0",
+            "mandatory": False,
+            "releaseNotes": "Exact publisher-supplied release notes.",
             "installer": {
-                "filename": filename,
                 "url": f"https://updates.example.test/releases/{version}/{filename}",
                 "size": len(installer_bytes),
                 "sha256": hashlib.sha256(installer_bytes).hexdigest(),
@@ -123,7 +127,13 @@ class DesktopUpdateStoreTests(unittest.TestCase):
         if manifest_changes:
             for key, value in manifest_changes.items():
                 if key.startswith("installer."):
-                    document["installer"][key.split(".", 1)[1]] = value
+                    installer_key = key.split(".", 1)[1]
+                    if value is DELETE:
+                        document["installer"].pop(installer_key, None)
+                    else:
+                        document["installer"][installer_key] = value
+                elif value is DELETE:
+                    document.pop(key, None)
                 else:
                     document[key] = value
         manifest = (json.dumps(document, indent=2) + "\n").encode()
@@ -323,11 +333,26 @@ class DesktopUpdateStoreTests(unittest.TestCase):
     def test_manifest_rejects_unsafe_or_non_https_installer_urls(self):
         unsafe_urls = (
             "http://updates.example.test/releases/Zeta-Setup-1.2.3.exe",
+            "/api/desktop/updates/stable/Zeta-Setup-1.2.3.exe",
+            "https:///releases/Zeta-Setup-1.2.3.exe",
             "https://user:secret@updates.example.test/releases/Zeta-Setup-1.2.3.exe",
+            " https://updates.example.test/releases/Zeta-Setup-1.2.3.exe",
+            "https://updates.example.test/releases/Zeta-Setup-1.2.3.exe ",
+            "https://updates.example.test/releases/Zeta Setup-1.2.3.exe",
+            "https://updates.example.test/releases\\Zeta-Setup-1.2.3.exe",
             "https://updates.example.test/releases/../Zeta-Setup-1.2.3.exe",
+            "https://updates.example.test/releases/./Zeta-Setup-1.2.3.exe",
             "https://updates.example.test/releases/%2e%2e/Zeta-Setup-1.2.3.exe",
+            "https://updates.example.test/releases/%5Aeta-Setup-1.2.3.exe",
+            "https://updates.example.test/releases//Zeta-Setup-1.2.3.exe",
+            "https://updates.example.test/releases/Zeta-Setup-1.2.3.exe/",
+            "https://updates.example.test/releases/Zeta-Setup-1.2.3.exe?",
             "https://updates.example.test/releases/Zeta-Setup-1.2.3.exe?token=secret",
+            "https://updates.example.test/releases/Zeta-Setup-1.2.3.exe#",
+            "https://updates.example.test/releases/Zeta-Setup-1.2.3.exe#download",
             "https://updates.example.test/releases/other.exe",
+            "https://updates.example.test/releases/zeta-Setup-1.2.3.exe",
+            "https://updates.example.test/releases/Zeta-Setup-1.2.4.exe",
         )
         for url in unsafe_urls:
             with self.subTest(url=url):
@@ -342,12 +367,9 @@ class DesktopUpdateStoreTests(unittest.TestCase):
                         installer_source=installer,
                     )
 
-    def test_manifest_requires_exact_versioned_installer_filename(self):
+    def test_installer_filename_is_derived_from_url_and_must_match_version(self):
         manifest, _, summary, installer = self.release_inputs(
-            manifest_changes={
-                "installer.filename": "Zeta.exe",
-                "installer.url": "https://updates.example.test/releases/Zeta.exe",
-            }
+            manifest_changes={"installer.url": "https://updates.example.test/releases/Zeta.exe"}
         )
         with self.assertRaisesRegex(updates.UpdateValidationError, "Zeta-Setup"):
             self.store.publish(
@@ -355,6 +377,107 @@ class DesktopUpdateStoreTests(unittest.TestCase):
                 signature_bytes=sign_for_test(manifest),
                 summary_bytes=summary,
                 installer_source=installer,
+            )
+
+    def test_canonical_optional_authenticode_metadata_is_accepted(self):
+        result, supplied = self.publish(
+            manifest_changes={
+                "releaseNotes": DELETE,
+                "installer.authenticode": {
+                    "publisherSubject": "CN=Zeta",
+                    "certificateThumbprint": "A" * 64,
+                }
+            }
+        )
+        self.assertTrue(result.changed)
+        self.assertEqual(result.release.manifest_path.read_bytes(), supplied[0])
+
+    def test_authenticode_metadata_shape_and_values_are_strict(self):
+        invalid_values = (
+            None,
+            "CN=Zeta",
+            [],
+            {"publisherSubject": "CN=Zeta"},
+            {"certificateThumbprint": "A" * 64},
+            {
+                "publisherSubject": "CN=Zeta",
+                "certificateThumbprint": "A" * 64,
+                "unexpected": "value",
+            },
+            {
+                "publisherSubject": "",
+                "certificateThumbprint": "A" * 64,
+            },
+            {
+                "publisherSubject": "   ",
+                "certificateThumbprint": "A" * 64,
+            },
+            {
+                "publisherSubject": "X" * 513,
+                "certificateThumbprint": "A" * 64,
+            },
+            {
+                "publisherSubject": "CN=Zeta",
+                "certificateThumbprint": "a" * 64,
+            },
+            {
+                "publisherSubject": "CN=Zeta",
+                "certificateThumbprint": "A" * 39,
+            },
+        )
+        for authenticode in invalid_values:
+            with self.subTest(authenticode=authenticode):
+                manifest, _, summary, installer = self.release_inputs(
+                    manifest_changes={"installer.authenticode": authenticode}
+                )
+                with self.assertRaises(updates.UpdateValidationError):
+                    self.store.publish(
+                        manifest_bytes=manifest,
+                        signature_bytes=sign_for_test(manifest),
+                        summary_bytes=summary,
+                        installer_source=installer,
+                    )
+
+    def test_canonical_policy_metadata_is_validated(self):
+        invalid_changes = (
+            {"publishedAt": "not-a-timestamp"},
+            {"publishedAt": "2026-09-10T12:00:00"},
+            {"publishedAt": "2026-09-10T12:00:00." + "1" * 39 + "+00:00"},
+            {"minimumSupportedVersion": "not-semver"},
+            {"minimumSupportedVersion": "2.0.0"},
+            {"mandatory": 0},
+            {"mandatory": "false"},
+            {"releaseNotes": None},
+            {"releaseNotes": "x" * 16_385},
+        )
+        for changes in invalid_changes:
+            with self.subTest(changes=changes):
+                manifest, _, summary, installer = self.release_inputs(
+                    manifest_changes=changes
+                )
+                with self.assertRaises(updates.UpdateValidationError):
+                    self.store.publish(
+                        manifest_bytes=manifest,
+                        signature_bytes=sign_for_test(manifest),
+                        summary_bytes=summary,
+                        installer_source=installer,
+                    )
+
+        result, _ = self.publish(
+            manifest_changes={"minimumSupportedVersion": None}
+        )
+        self.assertTrue(result.changed)
+
+    def test_installer_source_name_must_match_url_derived_filename(self):
+        manifest, signature, summary, installer = self.release_inputs()
+        wrong_name = installer.with_name("renamed-installer.exe")
+        installer.rename(wrong_name)
+        with self.assertRaises(updates.UpdateValidationError):
+            self.store.publish(
+                manifest_bytes=manifest,
+                signature_bytes=signature,
+                summary_bytes=summary,
+                installer_source=wrong_name,
             )
 
     def test_installer_hash_size_and_symlink_are_checked(self):
@@ -611,14 +734,88 @@ class DesktopUpdateStoreTests(unittest.TestCase):
                     installer_source=installer,
                 )
 
-    def test_manifest_requires_schema_version_integer_one(self):
-        for invalid in (None, True, 0, 2, "1"):
-            with self.subTest(schema_version=invalid):
+    def test_manifest_requires_canonical_schema_version_integer_one(self):
+        for invalid in (DELETE, None, True, False, 0, 1.0, 2, "1"):
+            with self.subTest(schemaVersion=invalid):
                 manifest, _, summary, installer = self.release_inputs(
-                    manifest_changes={"schema_version": invalid}
+                    manifest_changes={"schemaVersion": invalid}
                 )
                 with self.assertRaisesRegex(
-                    updates.UpdateValidationError, "schema_version"
+                    updates.UpdateValidationError, "schemaVersion"
+                ):
+                    self.store.publish(
+                        manifest_bytes=manifest,
+                        signature_bytes=sign_for_test(manifest),
+                        summary_bytes=summary,
+                        installer_source=installer,
+                    )
+
+    def test_manifest_requires_every_canonical_top_level_field(self):
+        required_fields = (
+            "product",
+            "channel",
+            "version",
+            "publishedAt",
+            "minimumSupportedVersion",
+            "mandatory",
+            "installer",
+        )
+        for field in required_fields:
+            with self.subTest(field=field):
+                manifest, _, summary, installer = self.release_inputs(
+                    manifest_changes={field: DELETE}
+                )
+                with self.assertRaises(updates.UpdateValidationError):
+                    self.store.publish(
+                        manifest_bytes=manifest,
+                        signature_bytes=sign_for_test(manifest),
+                        summary_bytes=summary,
+                        installer_source=installer,
+                    )
+
+    def test_manifest_requires_every_canonical_installer_field(self):
+        for field in ("url", "size", "sha256"):
+            with self.subTest(field=field):
+                manifest, _, summary, installer = self.release_inputs(
+                    manifest_changes={f"installer.{field}": DELETE}
+                )
+                with self.assertRaises(updates.UpdateValidationError):
+                    self.store.publish(
+                        manifest_bytes=manifest,
+                        signature_bytes=sign_for_test(manifest),
+                        summary_bytes=summary,
+                        installer_source=installer,
+                    )
+
+    def test_manifest_rejects_legacy_and_mixed_schema_spellings(self):
+        for changes in (
+            {"schemaVersion": DELETE, "schema_version": 1},
+            {"schema_version": 1},
+        ):
+            with self.subTest(changes=changes):
+                manifest, _, summary, installer = self.release_inputs(
+                    manifest_changes=changes
+                )
+                with self.assertRaises(updates.UpdateValidationError):
+                    self.store.publish(
+                        manifest_bytes=manifest,
+                        signature_bytes=sign_for_test(manifest),
+                        summary_bytes=summary,
+                        installer_source=installer,
+                    )
+
+    def test_manifest_rejects_unknown_top_level_and_installer_properties(self):
+        for changes in (
+            {"unexpected": "value"},
+            {"installer.filename": "Zeta-Setup-1.2.3.exe"},
+            {"installer.unexpected": "value"},
+        ):
+            with self.subTest(changes=changes):
+                manifest, _, summary, installer = self.release_inputs(
+                    manifest_changes=changes
+                )
+                with self.assertRaisesRegex(
+                    updates.UpdateValidationError, "unsupported|unknown"
                 ):
                     self.store.publish(
                         manifest_bytes=manifest,

@@ -132,23 +132,26 @@ class DesktopUpdatePublisherTests(unittest.TestCase):
                 ]
             )
 
-        target = self.inputs["Zeta-Setup-1.2.3.exe"]
-        link = self.base / "linked.exe"
-        link.symlink_to(target)
-        with self.assertRaises(SystemExit):
-            publisher.build_parser().parse_args(
-                [
-                    "publish",
-                    "--exe",
-                    str(link),
-                    "--latest",
-                    str(self.inputs["latest.json"]),
-                    "--sig",
-                    str(self.inputs["latest.json.sig"]),
-                    "--release-summary",
-                    str(self.inputs["release-summary.json"]),
-                ]
-            )
+        options = {
+            "--exe": "Zeta-Setup-1.2.3.exe",
+            "--latest": "latest.json",
+            "--sig": "latest.json.sig",
+            "--release-summary": "release-summary.json",
+        }
+        for option, name in options.items():
+            with self.subTest(option=option):
+                link = self.base / f"linked-{name}"
+                link.symlink_to(self.inputs[name])
+                arguments = ["publish"]
+                for candidate_option, candidate_name in options.items():
+                    candidate_path = (
+                        link
+                        if candidate_option == option
+                        else self.inputs[candidate_name]
+                    )
+                    arguments.extend((candidate_option, str(candidate_path)))
+                with self.assertRaises(SystemExit):
+                    publisher.build_parser().parse_args(arguments)
 
     def test_recognizable_openwebui_source_paths_are_rejected(self):
         source = self.base / "openwebui"
