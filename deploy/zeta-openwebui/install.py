@@ -4,8 +4,8 @@
 The deployed OpenWebUI tree is not itself a Git checkout.  This installer
 therefore validates reviewed base files, creates a timestamped rollback copy,
 and writes only the overlay modules plus small marked integrations in
-``open_webui/main.py``, ``open_webui/routers/openai.py``, and the reviewed
-frontend model editor.
+``open_webui/main.py``, ``open_webui/routers/openai.py``,
+``open_webui/utils/models.py``, and the reviewed frontend model editor.
 """
 
 from __future__ import annotations
@@ -22,9 +22,17 @@ from datetime import datetime, timezone
 
 EXPECTED_MAIN_SHA256 = "fa65867e7d07ccb133cb0e0f22b763762512289601371f56eedb0fdbf05f715f"
 EXPECTED_OPENAI_SHA256 = "66ae2ff0705f711fe8dc5b6ce9d1ef07b06e8d1c1956c432ca779e0591691363"
+EXPECTED_MODELS_SHA256 = {
+    # Reviewed source before the emergency identity-safe removal hotfix.
+    "be64923a505d5b2d2e54cac187132debf9d5bc0b3386400fbaf54a7e1bf92b39",
+    # The same reviewed source with that one-line-equivalent hotfix applied.
+    "58dd7d739870a97eb4df53ea73e67aaec2e6aa34806606e65237cbc1da71a8e2",
+}
 ROUTER_MARKER = "# BEGIN ZETA MODEL CATALOG ROUTER"
 STATUS_MARKER = "# BEGIN ZETA MODEL CATALOG OFFLINE STATUS"
 OPENAI_ENABLEMENT_MARKER = "# BEGIN ZETA MODEL ENABLEMENT HELPERS"
+MODELS_LOOKUP_MARKER = "# BEGIN ZETA EXACT MODEL OVERRIDE LOOKUPS"
+MODELS_REMOVAL_MARKER = "# BEGIN ZETA IDENTITY-SAFE MODEL REMOVAL"
 
 IMPORT_ANCHOR = """    memories,
     models,
@@ -277,6 +285,56 @@ OPENAI_REQUIRED_BLOCKS = {
     "speech gate": OPENAI_SPEECH_REPLACEMENT,
 }
 
+MODELS_LOOKUP_ANCHOR = """    # Single O(1) lookup: Ollama base names first, then exact IDs (exact wins).
+    base_model_lookup = {}
+    for model in models:
+        if model.get('owned_by') == 'ollama':
+            base_model_lookup.setdefault(model['id'].split(':')[0], model)
+        base_model_lookup[model['id']] = model
+"""
+MODELS_LOOKUP_REPLACEMENT = """    # BEGIN ZETA EXACT MODEL OVERRIDE LOOKUPS
+    # A direct model override/disable must match the provider ID exactly.
+    # Ollama's colonless shorthand remains available only for preset bases.
+    exact_model_lookup = {model['id']: model for model in models}
+    base_model_lookup = dict(exact_model_lookup)
+    for model in models:
+        if model.get('owned_by') == 'ollama':
+            base_model_lookup.setdefault(model['id'].split(':')[0], model)
+    # END ZETA EXACT MODEL OVERRIDE LOOKUPS
+"""
+
+MODELS_DIRECT_LOOKUP_ANCHOR = """            model = base_model_lookup.get(custom_model.id)
+"""
+MODELS_DIRECT_LOOKUP_REPLACEMENT = """            model = exact_model_lookup.get(custom_model.id)
+"""
+
+MODELS_ORIGINAL_REMOVAL = """                else:
+                    models.remove(model)
+"""
+MODELS_HOTFIX_REMOVAL = """                else:
+                    # Multiple disabled registry IDs can resolve to the same
+                    # Ollama base-name alias. Remove that exact provider
+                    # object at most once instead of raising on a stale alias.
+                    models[:] = [
+                        candidate for candidate in models if candidate is not model
+                    ]
+"""
+MODELS_REMOVAL_REPLACEMENT = """                else:
+                    # BEGIN ZETA IDENTITY-SAFE MODEL REMOVAL
+                    # Never remove an equal-but-distinct provider record, and
+                    # make a stale/missing exact target a harmless no-op.
+                    models[:] = [
+                        candidate for candidate in models if candidate is not model
+                    ]
+                    # END ZETA IDENTITY-SAFE MODEL REMOVAL
+"""
+
+MODELS_REQUIRED_BLOCKS = {
+    "exact/shorthand lookups": MODELS_LOOKUP_REPLACEMENT,
+    "direct exact lookup": MODELS_DIRECT_LOOKUP_REPLACEMENT,
+    "identity-safe removal": MODELS_REMOVAL_REPLACEMENT,
+}
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -401,6 +459,59 @@ def transform_openai(source: str, source_hash: str) -> str:
     return source
 
 
+def transform_models(source: str, source_hash: str) -> str:
+    """Separate exact overrides from Ollama shorthand and remove safely."""
+
+    markers = (MODELS_LOOKUP_MARKER, MODELS_REMOVAL_MARKER)
+    present = [marker in source for marker in markers]
+    if all(present):
+        missing = [
+            label
+            for label, block in MODELS_REQUIRED_BLOCKS.items()
+            if source.count(block) != 1
+        ]
+        if missing:
+            raise RuntimeError(
+                "Model-merge markers exist but installation is incomplete: "
+                + ", ".join(missing)
+            )
+        return source
+
+    if any(present):
+        raise RuntimeError("Partial Zeta model-merge installation detected")
+    if source_hash not in EXPECTED_MODELS_SHA256:
+        expected = ", ".join(sorted(EXPECTED_MODELS_SHA256))
+        raise RuntimeError(
+            "OpenWebUI utils/models.py differs from the reviewed bases; refusing "
+            f"to patch (expected one of {expected}, found {source_hash})"
+        )
+
+    source = replace_once(
+        source,
+        MODELS_LOOKUP_ANCHOR,
+        MODELS_LOOKUP_REPLACEMENT,
+        "model lookup",
+    )
+    source = replace_once(
+        source,
+        MODELS_DIRECT_LOOKUP_ANCHOR,
+        MODELS_DIRECT_LOOKUP_REPLACEMENT,
+        "direct exact model lookup",
+    )
+    if source.count(MODELS_ORIGINAL_REMOVAL) == 1:
+        removal = MODELS_ORIGINAL_REMOVAL
+    elif source.count(MODELS_HOTFIX_REMOVAL) == 1:
+        removal = MODELS_HOTFIX_REMOVAL
+    else:
+        raise RuntimeError("Unable to locate the reviewed disabled-model removal")
+    return replace_once(
+        source,
+        removal,
+        MODELS_REMOVAL_REPLACEMENT,
+        "identity-safe model removal",
+    )
+
+
 def atomic_write(path: Path, data: bytes, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -427,6 +538,9 @@ def install(backend: Path, check_only: bool) -> tuple[Path | None, bool]:
     openai_path = backend / "open_webui" / "routers" / "openai.py"
     if not openai_path.is_file():
         raise RuntimeError(f"OpenWebUI openai.py not found beneath {backend}")
+    models_path = backend / "open_webui" / "utils" / "models.py"
+    if not models_path.is_file():
+        raise RuntimeError(f"OpenWebUI utils/models.py not found beneath {backend}")
     model_editor_path = (
         openwebui_root
         / "src"
@@ -465,6 +579,9 @@ def install(backend: Path, check_only: bool) -> tuple[Path | None, bool]:
     original_openai = openai_path.read_text(encoding="utf-8")
     transformed_openai = transform_openai(original_openai, sha256(openai_path))
     compile(transformed_openai, str(openai_path), "exec")
+    original_models = models_path.read_text(encoding="utf-8")
+    transformed_models = transform_models(original_models, sha256(models_path))
+    compile(transformed_models, str(models_path), "exec")
     original_model_editor = model_editor_path.read_text(encoding="utf-8")
     transformed_model_editor = frontend_overlay.transform_model_editor(
         original_model_editor,
@@ -474,6 +591,7 @@ def install(backend: Path, check_only: bool) -> tuple[Path | None, bool]:
     targets_changed = (
         transformed != original
         or transformed_openai != original_openai
+        or transformed_models != original_models
         or transformed_model_editor != original_model_editor
         or any(
             not target.exists() or source.read_bytes() != target.read_bytes()
@@ -490,6 +608,9 @@ def install(backend: Path, check_only: bool) -> tuple[Path | None, bool]:
     backup_openai = backup / openai_path.relative_to(backend)
     backup_openai.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(openai_path, backup_openai)
+    backup_models = backup / models_path.relative_to(backend)
+    backup_models.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(models_path, backup_models)
     backup_model_editor = (
         backup / "_frontend" / model_editor_path.relative_to(openwebui_root)
     )
@@ -514,6 +635,11 @@ def install(backend: Path, check_only: bool) -> tuple[Path | None, bool]:
         openai_path.stat().st_mode,
     )
     atomic_write(
+        models_path,
+        transformed_models.encode("utf-8"),
+        models_path.stat().st_mode,
+    )
+    atomic_write(
         model_editor_path,
         transformed_model_editor.encode("utf-8"),
         model_editor_path.stat().st_mode,
@@ -524,6 +650,7 @@ def install(backend: Path, check_only: bool) -> tuple[Path | None, bool]:
 
     compile_python(main_path)
     compile_python(openai_path)
+    compile_python(models_path)
     for target in backend_sources.values():
         compile_python(target)
     return backup, True

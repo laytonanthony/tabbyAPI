@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -106,6 +108,45 @@ async def speech(request, user=None):
         raise
 """
 
+MINIMAL_MODELS = """async def get_all_models(models, custom_models):
+    # Single O(1) lookup: Ollama base names first, then exact IDs (exact wins).
+    base_model_lookup = {}
+    for model in models:
+        if model.get('owned_by') == 'ollama':
+            base_model_lookup.setdefault(model['id'].split(':')[0], model)
+        base_model_lookup[model['id']] = model
+
+    for custom_model in custom_models:
+        if custom_model.base_model_id is None:
+            # Override applied directly to a base model (shares the same ID)
+            model = base_model_lookup.get(custom_model.id)
+
+            if model:
+                if custom_model.is_active:
+                    model['name'] = custom_model.name
+                else:
+                    models.remove(model)
+
+        elif custom_model.is_active:
+            base_model = base_model_lookup.get(custom_model.base_model_id)
+            if base_model is None:
+                base_model = base_model_lookup.get(custom_model.base_model_id.split(':')[0])
+            if base_model:
+                models.append({
+                    'id': custom_model.id,
+                    'owned_by': base_model.get('owned_by'),
+                    'preset': True,
+                })
+    return models
+"""
+
+MINIMAL_MODELS_HOTFIX = MINIMAL_MODELS.replace(
+    """                else:
+                    models.remove(model)
+""",
+    installer.MODELS_HOTFIX_REMOVAL,
+)
+
 MINIMAL_MODEL_EDITOR = (
     "<script lang=\"ts\">\n"
     + frontend.IMPORT_ANCHOR
@@ -129,16 +170,19 @@ def create_install_tree(directory: str):
     backend = root / "backend"
     main_path = backend / "open_webui" / "main.py"
     openai_path = backend / "open_webui" / "routers" / "openai.py"
+    models_path = backend / "open_webui" / "utils" / "models.py"
     model_editor_path = (
         root / "src" / "lib" / "components" / "workspace" / "Models" / "ModelEditor.svelte"
     )
     main_path.parent.mkdir(parents=True)
     openai_path.parent.mkdir(parents=True)
+    models_path.parent.mkdir(parents=True)
     model_editor_path.parent.mkdir(parents=True)
     main_path.write_text(MINIMAL_MAIN)
     openai_path.write_text(MINIMAL_OPENAI)
+    models_path.write_text(MINIMAL_MODELS)
     model_editor_path.write_text(MINIMAL_MODEL_EDITOR)
-    return root, backend, main_path, openai_path, model_editor_path
+    return root, backend, main_path, openai_path, models_path, model_editor_path
 
 
 class TestOverlayInstaller(unittest.TestCase):
@@ -184,6 +228,131 @@ class TestOverlayInstaller(unittest.TestCase):
         self.assertIn("if not allowed_models:", transformed)
         compile(transformed, "openai.py", "exec")
 
+    def test_models_transform_is_guarded_complete_and_idempotent(self):
+        digest = hashlib.sha256(MINIMAL_MODELS.encode()).hexdigest()
+        with patch.object(installer, "EXPECTED_MODELS_SHA256", {digest}):
+            transformed = installer.transform_models(MINIMAL_MODELS, digest)
+            repeated = installer.transform_models(
+                transformed, hashlib.sha256(transformed.encode()).hexdigest()
+            )
+
+        self.assertEqual(transformed, repeated)
+        self.assertIn(installer.MODELS_LOOKUP_MARKER, transformed)
+        self.assertIn(installer.MODELS_REMOVAL_MARKER, transformed)
+        self.assertIn("exact_model_lookup.get(custom_model.id)", transformed)
+        self.assertIn("base_model_lookup.get(custom_model.base_model_id)", transformed)
+        compile(transformed, "models.py", "exec")
+
+    def test_models_transform_upgrades_reviewed_emergency_hotfix(self):
+        digest = hashlib.sha256(MINIMAL_MODELS_HOTFIX.encode()).hexdigest()
+        with patch.object(installer, "EXPECTED_MODELS_SHA256", {digest}):
+            transformed = installer.transform_models(MINIMAL_MODELS_HOTFIX, digest)
+
+        self.assertIn(installer.MODELS_LOOKUP_REPLACEMENT, transformed)
+        self.assertIn(installer.MODELS_REMOVAL_REPLACEMENT, transformed)
+        self.assertNotIn(installer.MODELS_HOTFIX_REMOVAL, transformed)
+
+    def test_transformed_model_merge_handles_live_collision_and_keeps_qwen(self):
+        digest = hashlib.sha256(MINIMAL_MODELS.encode()).hexdigest()
+        with patch.object(installer, "EXPECTED_MODELS_SHA256", {digest}):
+            transformed = installer.transform_models(MINIMAL_MODELS, digest)
+        namespace = {}
+        exec(compile(transformed, "models.py", "exec"), namespace)
+        models = [
+            {"id": "Qwen3.8", "name": "Qwen3.8", "owned_by": "openai"},
+            {
+                "id": "deepseek-v4-flash:cloud",
+                "name": "DeepSeek cloud",
+                "owned_by": "ollama",
+            },
+        ]
+        custom_models = [
+            SimpleNamespace(
+                id="deepseek-v4-flash:cloud",
+                base_model_id=None,
+                is_active=False,
+                name="DeepSeek cloud",
+            ),
+            SimpleNamespace(
+                id="deepseek-v4-flash",
+                base_model_id=None,
+                is_active=False,
+                name="DeepSeek",
+            ),
+            SimpleNamespace(
+                id="Qwen3.8",
+                base_model_id=None,
+                is_active=True,
+                name="Zeta Qwen",
+            ),
+        ]
+
+        result = asyncio.run(namespace["get_all_models"](models, custom_models))
+
+        self.assertEqual([model["id"] for model in result], ["Qwen3.8"])
+        self.assertEqual(result[0]["name"], "Zeta Qwen")
+
+    def test_transformed_model_merge_exact_noop_and_preset_shorthand(self):
+        digest = hashlib.sha256(MINIMAL_MODELS.encode()).hexdigest()
+        with patch.object(installer, "EXPECTED_MODELS_SHA256", {digest}):
+            transformed = installer.transform_models(MINIMAL_MODELS, digest)
+        namespace = {}
+        exec(compile(transformed, "models.py", "exec"), namespace)
+
+        exact = asyncio.run(
+            namespace["get_all_models"](
+                [{"id": "paid:cloud", "owned_by": "ollama"}],
+                [
+                    SimpleNamespace(
+                        id="paid:cloud",
+                        base_model_id=None,
+                        is_active=False,
+                        name="Paid",
+                    )
+                ],
+            )
+        )
+        missing_exact = asyncio.run(
+            namespace["get_all_models"](
+                [{"id": "local:latest", "owned_by": "ollama"}],
+                [
+                    SimpleNamespace(
+                        id="local",
+                        base_model_id=None,
+                        is_active=False,
+                        name="Local",
+                    )
+                ],
+            )
+        )
+        preset = asyncio.run(
+            namespace["get_all_models"](
+                [{"id": "local:latest", "owned_by": "ollama"}],
+                [
+                    SimpleNamespace(
+                        id="friendly-preset",
+                        base_model_id="local",
+                        is_active=True,
+                        name="Friendly",
+                    )
+                ],
+            )
+        )
+
+        self.assertEqual(exact, [])
+        self.assertEqual([model["id"] for model in missing_exact], ["local:latest"])
+        self.assertEqual(
+            preset,
+            [
+                {"id": "local:latest", "owned_by": "ollama"},
+                {
+                    "id": "friendly-preset",
+                    "owned_by": "ollama",
+                    "preset": True,
+                },
+            ],
+        )
+
     def test_unknown_main_source_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "differs from the reviewed base"):
             installer.transform_main(MINIMAL_MAIN, "0" * 64)
@@ -191,6 +360,10 @@ class TestOverlayInstaller(unittest.TestCase):
     def test_unknown_openai_source_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "differs from the reviewed base"):
             installer.transform_openai(MINIMAL_OPENAI, "0" * 64)
+
+    def test_unknown_models_source_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "differs from the reviewed bases"):
+            installer.transform_models(MINIMAL_MODELS, "0" * 64)
 
     def test_partial_or_corrupted_installed_overlay_is_refused(self):
         digest = hashlib.sha256(MINIMAL_MAIN.encode()).hexdigest()
@@ -222,20 +395,40 @@ class TestOverlayInstaller(unittest.TestCase):
                 corrupted, hashlib.sha256(corrupted.encode()).hexdigest()
             )
 
+    def test_partial_or_corrupted_models_overlay_is_refused(self):
+        digest = hashlib.sha256(MINIMAL_MODELS.encode()).hexdigest()
+        with patch.object(installer, "EXPECTED_MODELS_SHA256", {digest}):
+            transformed = installer.transform_models(MINIMAL_MODELS, digest)
+        corrupted = transformed.replace(installer.MODELS_REMOVAL_REPLACEMENT, "")
+
+        with self.assertRaisesRegex(RuntimeError, "Partial Zeta model-merge"):
+            installer.transform_models(
+                corrupted, hashlib.sha256(corrupted.encode()).hexdigest()
+            )
+
     def test_check_mode_does_not_write(self):
         with tempfile.TemporaryDirectory() as directory:
-            root, backend, main_path, openai_path, model_editor_path = create_install_tree(
-                directory
-            )
+            (
+                root,
+                backend,
+                main_path,
+                openai_path,
+                models_path,
+                model_editor_path,
+            ) = create_install_tree(directory)
             digest = hashlib.sha256(MINIMAL_MAIN.encode()).hexdigest()
             openai_digest = hashlib.sha256(MINIMAL_OPENAI.encode()).hexdigest()
+            models_digest = hashlib.sha256(MINIMAL_MODELS.encode()).hexdigest()
             model_editor_digest = hashlib.sha256(MINIMAL_MODEL_EDITOR.encode()).hexdigest()
             before = main_path.read_bytes()
             openai_before = openai_path.read_bytes()
+            models_before = models_path.read_bytes()
             model_editor_before = model_editor_path.read_bytes()
 
             with patch.object(installer, "EXPECTED_MAIN_SHA256", digest), patch.object(
                 installer, "EXPECTED_OPENAI_SHA256", openai_digest
+            ), patch.object(
+                installer, "EXPECTED_MODELS_SHA256", {models_digest}
             ), patch.object(
                 frontend, "EXPECTED_MODEL_EDITOR_SHA256", model_editor_digest
             ), patch.object(
@@ -247,21 +440,30 @@ class TestOverlayInstaller(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(main_path.read_bytes(), before)
             self.assertEqual(openai_path.read_bytes(), openai_before)
+            self.assertEqual(models_path.read_bytes(), models_before)
             self.assertEqual(model_editor_path.read_bytes(), model_editor_before)
             self.assertFalse((root / "src" / "lib" / "utils" / "zetaModelCatalog.ts").exists())
             self.assertFalse((backend / ".zeta-backups").exists())
 
     def test_install_patches_and_backs_up_openai_and_existing_status_body(self):
         with tempfile.TemporaryDirectory() as directory:
-            root, backend, main_path, openai_path, model_editor_path = create_install_tree(
-                directory
-            )
+            (
+                root,
+                backend,
+                main_path,
+                openai_path,
+                models_path,
+                model_editor_path,
+            ) = create_install_tree(directory)
             digest = hashlib.sha256(MINIMAL_MAIN.encode()).hexdigest()
             openai_digest = hashlib.sha256(MINIMAL_OPENAI.encode()).hexdigest()
+            models_digest = hashlib.sha256(MINIMAL_MODELS.encode()).hexdigest()
             model_editor_digest = hashlib.sha256(MINIMAL_MODEL_EDITOR.encode()).hexdigest()
 
             with patch.object(installer, "EXPECTED_MAIN_SHA256", digest), patch.object(
                 installer, "EXPECTED_OPENAI_SHA256", openai_digest
+            ), patch.object(
+                installer, "EXPECTED_MODELS_SHA256", {models_digest}
             ), patch.object(
                 frontend, "EXPECTED_MODEL_EDITOR_SHA256", model_editor_digest
             ), patch.object(
@@ -273,6 +475,7 @@ class TestOverlayInstaller(unittest.TestCase):
             self.assertTrue(changed)
             self.assertIsNotNone(backup)
             self.assertIn(installer.OPENAI_ENABLEMENT_MARKER, openai_path.read_text())
+            self.assertIn(installer.MODELS_LOOKUP_MARKER, models_path.read_text())
             self.assertIn("seen_model_ids = set()", transformed)
             self.assertIn("content={'data': data}", transformed)
             self.assertIn(installer.STATUS_APPEND, transformed)
@@ -282,6 +485,10 @@ class TestOverlayInstaller(unittest.TestCase):
             self.assertEqual(
                 (backup / "open_webui" / "routers" / "openai.py").read_text(),
                 MINIMAL_OPENAI,
+            )
+            self.assertEqual(
+                (backup / "open_webui" / "utils" / "models.py").read_text(),
+                MINIMAL_MODELS,
             )
             self.assertEqual(
                 (

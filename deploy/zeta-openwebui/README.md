@@ -73,6 +73,13 @@ OpenWebUI model row. The per-model switch fully covers the JSON DeepSeek/Zeta
 chat and Responses paths described above, but is not a substitute for turning
 off an entire provider connection.
 
+The merged OpenWebUI `/api/models` picker applies a direct base-model override
+only to an exact provider ID. Ollama's colonless shorthand (for example,
+`local` matching `local:latest`) remains available for active presets, but is
+not used to disable a different exact model. Disabled exact records are
+removed by object identity, so overlapping `name` and `name:cloud` records
+cannot double-remove the same provider item and crash the picker.
+
 ## Endpoint and authentication
 
 ```
@@ -294,8 +301,9 @@ python deploy/zeta-openwebui/install.py \
 
 The installer:
 
-- validates the reviewed `main.py`, `openai.py`, and model-editor source hashes
-  (or recognizes an existing complete installation);
+- validates the reviewed `main.py`, `openai.py`, `utils/models.py`, and
+  model-editor source hashes (or recognizes an existing complete
+  installation);
 - compiles all Python before writing;
 - creates a timestamped backup beneath
   `backend/.zeta-backups/model-catalog-<UTC timestamp>`;

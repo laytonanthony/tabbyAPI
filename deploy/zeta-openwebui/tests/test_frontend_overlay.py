@@ -21,7 +21,18 @@ class TestFrontendOverlay(unittest.TestCase):
     def test_reviewed_model_editor_transforms_and_is_idempotent(self):
         source = RUNTIME_MODEL_EDITOR.read_text(encoding="utf-8")
         digest = hashlib.sha256(source.encode()).hexdigest()
-        self.assertEqual(digest, frontend.EXPECTED_MODEL_EDITOR_SHA256)
+        already_installed = all(
+            marker in source
+            for marker in (
+                frontend.IMPORT_MARKER,
+                frontend.STATE_MARKER,
+                frontend.SUBMIT_MARKER,
+                frontend.LOAD_MARKER,
+                frontend.UI_MARKER,
+            )
+        )
+        if not already_installed:
+            self.assertEqual(digest, frontend.EXPECTED_MODEL_EDITOR_SHA256)
 
         transformed = frontend.transform_model_editor(source, digest)
         repeated = frontend.transform_model_editor(
@@ -40,11 +51,14 @@ class TestFrontendOverlay(unittest.TestCase):
     @unittest.skipUnless(RUNTIME_MODEL_EDITOR.is_file(), "reviewed OpenWebUI source unavailable")
     def test_partial_install_is_refused(self):
         source = RUNTIME_MODEL_EDITOR.read_text(encoding="utf-8")
-        partial = source.replace(
-            frontend.IMPORT_ANCHOR,
-            frontend.IMPORT_BLOCK,
-            1,
-        )
+        if frontend.STATE_MARKER in source:
+            partial = source.replace(frontend.STATE_BLOCK, frontend.STATE_ANCHOR, 1)
+        else:
+            partial = source.replace(
+                frontend.IMPORT_ANCHOR,
+                frontend.IMPORT_BLOCK,
+                1,
+            )
         with self.assertRaisesRegex(RuntimeError, "Partial Zeta"):
             frontend.transform_model_editor(partial, hashlib.sha256(partial.encode()).hexdigest())
 
