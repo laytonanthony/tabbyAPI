@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the versioned Zeta model-catalogue overlay into OpenWebUI.
+"""Install the versioned Zeta OpenWebUI overlay.
 
 The deployed OpenWebUI tree is not itself a Git checkout.  This installer
 therefore validates reviewed base files, creates a timestamped rollback copy,
@@ -30,6 +30,13 @@ EXPECTED_MODELS_SHA256 = {
 }
 ROUTER_MARKER = "# BEGIN ZETA MODEL CATALOG ROUTER"
 STATUS_MARKER = "# BEGIN ZETA MODEL CATALOG OFFLINE STATUS"
+DESKTOP_UPDATE_ROUTER_MARKER = "# BEGIN ZETA DESKTOP UPDATE ROUTER"
+DESKTOP_UPDATE_ROUTER_END_MARKER = "# END ZETA DESKTOP UPDATE ROUTER"
+DESKTOP_UPDATE_IMPORT_LINE = "    zeta_desktop_updates,"
+DESKTOP_UPDATE_INCLUDE_LINE = (
+    "app.include_router(zeta_desktop_updates.router, "
+    "prefix='/api/desktop/updates', tags=['desktop-updates'])"
+)
 OPENAI_ENABLEMENT_MARKER = "# BEGIN ZETA MODEL ENABLEMENT HELPERS"
 MODELS_LOOKUP_MARKER = "# BEGIN ZETA EXACT MODEL OVERRIDE LOOKUPS"
 MODELS_REMOVAL_MARKER = "# BEGIN ZETA IDENTITY-SAFE MODEL REMOVAL"
@@ -44,11 +51,23 @@ IMPORT_REPLACEMENT = """    memories,
     knowledge,
 """
 
+DESKTOP_UPDATE_IMPORT_REPLACEMENT = """    memories,
+    models,
+    zeta_model_catalog,
+    zeta_desktop_updates,
+    knowledge,
+"""
+
 INCLUDE_ANCHOR = "app.include_router(models.router, prefix='/api/v1/models', tags=['models'])"
 INCLUDE_REPLACEMENT = f"""{INCLUDE_ANCHOR}
 {ROUTER_MARKER}
 app.include_router(zeta_model_catalog.router, prefix='/api/v1/models', tags=['models'])
 # END ZETA MODEL CATALOG ROUTER"""
+
+DESKTOP_UPDATE_INCLUDE_REPLACEMENT = f"""{INCLUDE_REPLACEMENT}
+{DESKTOP_UPDATE_ROUTER_MARKER}
+{DESKTOP_UPDATE_INCLUDE_LINE}
+{DESKTOP_UPDATE_ROUTER_END_MARKER}"""
 
 OLD_STATUS_APPEND = """    # BEGIN ZETA MODEL CATALOG OFFLINE STATUS
     # Preserve the existing live status records, then add only authorised
@@ -367,30 +386,87 @@ def replace_once(source: str, old: str, new: str, label: str) -> str:
     return source.replace(old, new, 1)
 
 
-def transform_main(source: str, source_hash: str) -> str:
-    installed = ROUTER_MARKER in source and STATUS_MARKER in source
-    if installed:
+def transform_desktop_update_router(source: str) -> str:
+    """Add or validate the public desktop-update router integration."""
+
+    if DESKTOP_UPDATE_ROUTER_MARKER in source:
+        if (
+            source.count(DESKTOP_UPDATE_ROUTER_MARKER) != 1
+            or source.count(DESKTOP_UPDATE_ROUTER_END_MARKER) != 1
+            or source.count(DESKTOP_UPDATE_IMPORT_LINE) != 1
+            or source.count(DESKTOP_UPDATE_INCLUDE_LINE) != 1
+        ):
+            raise RuntimeError(
+                "Desktop-update router integration is duplicated or incomplete"
+            )
         required = {
-            "router import": IMPORT_REPLACEMENT,
-            "router include": INCLUDE_REPLACEMENT,
+            "desktop-update router import": DESKTOP_UPDATE_IMPORT_REPLACEMENT,
+            "desktop-update router include": DESKTOP_UPDATE_INCLUDE_REPLACEMENT,
         }
         missing = [
             label for label, block in required.items() if source.count(block) != 1
         ]
         if missing:
             raise RuntimeError(
+                "Desktop-update router marker exists but the installation is "
+                "incomplete: " + ", ".join(missing)
+            )
+        spa_mount = source.find(
+            "SPAStaticFiles(directory=FRONTEND_BUILD_DIR, html=True)"
+        )
+        router_include = source.find(DESKTOP_UPDATE_INCLUDE_REPLACEMENT)
+        if spa_mount >= 0 and router_include > spa_mount:
+            raise RuntimeError(
+                "Desktop-update router must be registered before the root SPA mount"
+            )
+        return source
+
+    if DESKTOP_UPDATE_ROUTER_END_MARKER in source or "zeta_desktop_updates" in source:
+        raise RuntimeError("Partial Zeta desktop-update router installation detected")
+
+    source = replace_once(
+        source,
+        IMPORT_REPLACEMENT,
+        DESKTOP_UPDATE_IMPORT_REPLACEMENT,
+        "desktop-update router import",
+    )
+    source = replace_once(
+        source,
+        INCLUDE_REPLACEMENT,
+        DESKTOP_UPDATE_INCLUDE_REPLACEMENT,
+        "desktop-update router include",
+    )
+    return transform_desktop_update_router(source)
+
+
+def transform_main(source: str, source_hash: str) -> str:
+    installed = ROUTER_MARKER in source and STATUS_MARKER in source
+    if installed:
+        catalogue_imports = (
+            source.count(IMPORT_REPLACEMENT)
+            + source.count(DESKTOP_UPDATE_IMPORT_REPLACEMENT)
+        )
+        if catalogue_imports != 1 or source.count(INCLUDE_REPLACEMENT) != 1:
+            raise RuntimeError(
                 "Catalogue markers exist but the installation is incomplete: "
-                + ", ".join(missing)
+                "router import/include"
             )
         if source.count(STATUS_APPEND) == 1:
-            return source
-        if source.count(OLD_STATUS_APPEND) == 1:
-            return source.replace(OLD_STATUS_APPEND, STATUS_APPEND, 1)
-        raise RuntimeError(
-            "Catalogue markers exist but the status overlay is unknown or incomplete"
-        )
+            transformed = source
+        elif source.count(OLD_STATUS_APPEND) == 1:
+            transformed = source.replace(OLD_STATUS_APPEND, STATUS_APPEND, 1)
+        else:
+            raise RuntimeError(
+                "Catalogue markers exist but the status overlay is unknown or incomplete"
+            )
+        return transform_desktop_update_router(transformed)
 
-    if ROUTER_MARKER in source or STATUS_MARKER in source:
+    if (
+        ROUTER_MARKER in source
+        or STATUS_MARKER in source
+        or DESKTOP_UPDATE_ROUTER_MARKER in source
+        or "zeta_desktop_updates" in source
+    ):
         raise RuntimeError("Partial Zeta model-catalogue installation detected")
     if source_hash != EXPECTED_MAIN_SHA256:
         raise RuntimeError(
@@ -407,7 +483,8 @@ def transform_main(source: str, source_hash: str) -> str:
     if status_block.count(return_anchor) != 1:
         raise RuntimeError("Unable to locate the status response anchor")
     status_block = status_block.replace(return_anchor, STATUS_APPEND + return_anchor, 1)
-    return source[:status_start] + status_block + source[status_end:]
+    source = source[:status_start] + status_block + source[status_end:]
+    return transform_desktop_update_router(source)
 
 
 def transform_openai(source: str, source_hash: str) -> str:
@@ -561,12 +638,19 @@ def install(backend: Path, check_only: bool) -> tuple[Path | None, bool]:
         backend_overlay_root / "utils" / "zeta_model_catalog.py": (
             backend / "open_webui" / "utils" / "zeta_model_catalog.py"
         ),
+        backend_overlay_root / "utils" / "zeta_desktop_updates.py": (
+            backend / "open_webui" / "utils" / "zeta_desktop_updates.py"
+        ),
         backend_overlay_root / "routers" / "zeta_model_catalog.py": (
             backend / "open_webui" / "routers" / "zeta_model_catalog.py"
+        ),
+        backend_overlay_root / "routers" / "zeta_desktop_updates.py": (
+            backend / "open_webui" / "routers" / "zeta_desktop_updates.py"
         ),
     }
     for source in backend_sources:
         compile_python(source)
+    compile_python(overlay_directory / "publish_desktop_release.py")
     frontend_overlay = load_frontend_overlay()
     frontend_sources = frontend_overlay.frontend_sources(
         overlay_directory, openwebui_root

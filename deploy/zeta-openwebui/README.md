@@ -1,10 +1,11 @@
-# Zeta desktop model catalogue
+# Zeta OpenWebUI server overlay
 
 This overlay adds an authenticated model catalogue and web-based catalogue
 metadata editor to the Zeta OpenWebUI deployment. The existing OpenWebUI
 model `Enabled` switch is also enforced consistently by the OpenAI-compatible
 model list and execution routes, so disabling a paid provider model removes
-it from Zeta and prevents outbound use.
+it from Zeta and prevents outbound use. It also provides a public, read-only
+feed for externally signed Zeta desktop releases.
 
 ## Architecture and source of truth
 
@@ -286,6 +287,129 @@ a model when it disappears from a successfully refreshed catalogue, and use
 the separate status response only to grey enabled catalogue members that are
 offline or unknown.
 
+## Signed desktop update feed
+
+The overlay also exposes a separate public, read-only stable update feed. It
+does not use OpenWebUI authentication and has no upload, signing, or mutation
+route. Desktop updaters should send no `Authorization` header:
+
+| Request | Response |
+|---|---|
+| `GET /api/desktop/updates/stable/latest.json` | Exact publisher-supplied UTF-8 manifest bytes. |
+| `GET /api/desktop/updates/stable/latest.json.sig` | Exact publisher-supplied canonical ASCII base64 signature text. |
+| `GET /api/desktop/updates/stable/Zeta-Setup-{version}.exe` | The retained installer named by a verified manifest. |
+
+Manifest and signature responses use `Cache-Control: no-cache`, a strong
+SHA-256 `ETag`, `X-Content-Type-Options: nosniff`, and support
+`If-None-Match`/`304`. Installers use `application/octet-stream`, an exact
+`Content-Length`, a content-disposition filename, the manifest SHA-256 as
+their strong ETag, and
+`Cache-Control: public, max-age=31536000, immutable, no-transform`.
+The pinned-file download response also supplies byte-range support. The update router is
+registered before the root SPA mount, and its catch-all returns JSON, so an
+unknown update URL can never become a `200 text/html` SPA response.
+
+Before the first publication, both `latest.json` and `latest.json.sig` return
+an explicit JSON `404`:
+
+```json
+{"detail":"No stable Zeta desktop release is published"}
+```
+
+Unknown versions and filenames return a generic JSON `404`. Invalid or
+unreadable signed state fails closed with a generic JSON `503`; filesystem
+paths, signature material, and exception text are not returned or logged.
+
+### Manifest and publication contract
+
+`latest.json` is a bounded UTF-8 JSON object. These fields are required and
+are verified before publication:
+
+```json
+{
+  "schema_version": 1,
+  "product": "Zeta",
+  "channel": "stable",
+  "version": "1.2.3",
+  "installer": {
+    "filename": "Zeta-Setup-1.2.3.exe",
+    "url": "https://www.zeta-ai.co.uk/api/desktop/updates/stable/Zeta-Setup-1.2.3.exe",
+    "size": 12345678,
+    "sha256": "lowercase-64-character-sha256"
+  }
+}
+```
+
+`version` and the filename use strict Semantic Versioning. The URL must be
+credential-free HTTPS, have no query/fragment/path traversal, and end in the
+exact installer filename. Installer size and SHA-256 must match its bytes.
+The detached signature is canonical base64 text (optionally ending in one LF
+or CRLF) containing an RSA PKCS#1 v1.5/SHA-256 signature over the **exact
+manifest bytes**. The server contains only an RSA public key of at least 2048
+bits; signing and private-key custody remain outside this repository and
+application.
+
+The publisher and OpenWebUI runtime require the Python `cryptography` package;
+the deployed `/home/anthony/zeta-workspace/venv` already provides it. A client
+whose manifest and signature requests straddle an atomic pointer change will
+fail signature verification safely and must refetch the pair before retrying.
+
+`release-summary.json` is a bounded publisher-supplied JSON object retained
+with the release for administration. If it supplies `product`, `channel`, or
+`version`, each must match the manifest. It is not a public endpoint.
+
+### External storage and local publisher
+
+The service and publisher must use the same two settings:
+
+| Setting | Default |
+|---|---|
+| `ZETA_DESKTOP_UPDATE_DIR` | `/home/anthony/.local/share/zeta/desktop-updates` |
+| `ZETA_DESKTOP_UPDATE_PUBLIC_KEY` | `/home/anthony/.config/zeta/desktop-updater/manifest-public-key.pem` |
+
+Both paths must be absolute and outside the live OpenWebUI application source
+tree. Provision the key parent directory as `0700` and the public PEM as
+`0600`; do not place a private key on the server. Publication creates the
+release root and release directories as `0700`, with pointers, artifacts,
+its dedicated-store marker, and its local lock as `0600`. A pre-created
+release root must be empty, owned by the service user, and already mode
+`0700`; broad or unrelated directories are refused without changing them.
+The installer deliberately neither creates these directories nor publishes a
+release, so `--check` is side-effect free.
+
+Publish already-built, externally signed artifacts locally on the server:
+
+```bash
+/home/anthony/zeta-workspace/venv/bin/python \
+  deploy/zeta-openwebui/publish_desktop_release.py \
+  --release-dir /home/anthony/.local/share/zeta/desktop-updates \
+  --public-key /home/anthony/.config/zeta/desktop-updater/manifest-public-key.pem \
+  publish \
+  --exe /absolute/build/Zeta-Setup-1.2.3.exe \
+  --latest /absolute/build/latest.json \
+  --sig /absolute/build/latest.json.sig \
+  --release-summary /absolute/build/release-summary.json
+```
+
+The CLI has no network or signing capability. It verifies the signature,
+contract, filename, full installer size/hash, and version ordering; stages
+the installer first; fsyncs immutable release files; and atomically replaces
+the small `current-version` pointer last. Normal publication cannot downgrade
+or mutate an existing version. Complete older releases remain retained and
+can be selected only by an explicit verified rollback:
+
+```bash
+/home/anthony/zeta-workspace/venv/bin/python \
+  deploy/zeta-openwebui/publish_desktop_release.py \
+  --release-dir /home/anthony/.local/share/zeta/desktop-updates \
+  --public-key /home/anthony/.config/zeta/desktop-updater/manifest-public-key.pem \
+  rollback 1.2.2
+```
+
+Publication and rollback take effect on the next request; they need no Zeta
+desktop release, frontend build, or OpenWebUI restart. Changing service
+environment variables still requires a normal service restart.
+
 ## Deployment and rollback
 
 The current OpenWebUI runtime directory is not a Git checkout. The reviewed
@@ -293,9 +417,9 @@ code therefore lives here in the `tabbyAPI` repository and is installed as a
 small, hash-guarded overlay:
 
 ```bash
-python deploy/zeta-openwebui/install.py \
+/home/anthony/zeta-workspace/venv/bin/python deploy/zeta-openwebui/install.py \
   '/path/to/openwebui/backend' --check
-python deploy/zeta-openwebui/install.py \
+/home/anthony/zeta-workspace/venv/bin/python deploy/zeta-openwebui/install.py \
   '/path/to/openwebui/backend'
 ```
 
@@ -309,7 +433,19 @@ The installer:
   `backend/.zeta-backups/model-catalog-<UTC timestamp>`;
 - atomically writes the overlay modules and marked backend/frontend
   integrations;
+- installs the public update router and verified-store helper, but creates no
+  update directory, key, release, or pointer;
 - is idempotent and copies no database, config, key, or environment data.
+
+Run the updater and overlay tests before deployment:
+
+```bash
+python -m pytest -q \
+  tests/test_zeta_desktop_updates.py \
+  tests/test_zeta_desktop_update_route.py \
+  tests/test_zeta_desktop_update_publisher.py \
+  tests/test_zeta_openwebui_overlay.py
+```
 
 After installation, build the OpenWebUI frontend, run the focused tests, wait
 for active requests to drain, restart only OpenWebUI, and verify

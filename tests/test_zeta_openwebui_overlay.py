@@ -41,6 +41,13 @@ async def get_model_runtime_status(
 @app.get('/api/v1/models')
 async def get_models():
     pass
+
+if os.path.exists(FRONTEND_BUILD_DIR):
+    app.mount(
+        '/',
+        SPAStaticFiles(directory=FRONTEND_BUILD_DIR, html=True),
+        name='spa-static-files',
+    )
 """
 
 MINIMAL_OPENAI = """import json
@@ -197,7 +204,38 @@ class TestOverlayInstaller(unittest.TestCase):
         self.assertEqual(transformed, repeated)
         self.assertIn(installer.ROUTER_MARKER, transformed)
         self.assertIn(installer.STATUS_MARKER, transformed)
+        self.assertIn(installer.DESKTOP_UPDATE_ROUTER_MARKER, transformed)
+        self.assertIn(installer.DESKTOP_UPDATE_IMPORT_REPLACEMENT, transformed)
+        self.assertLess(
+            transformed.index(installer.DESKTOP_UPDATE_ROUTER_MARKER),
+            transformed.index(
+                "SPAStaticFiles(directory=FRONTEND_BUILD_DIR, html=True)"
+            ),
+        )
         compile(transformed, "main.py", "exec")
+
+    def test_current_catalogue_install_upgrades_with_desktop_update_router(self):
+        digest = hashlib.sha256(MINIMAL_MAIN.encode()).hexdigest()
+        with patch.object(installer, "EXPECTED_MAIN_SHA256", digest):
+            current = installer.transform_main(MINIMAL_MAIN, digest)
+        current = current.replace(
+            installer.DESKTOP_UPDATE_IMPORT_REPLACEMENT,
+            installer.IMPORT_REPLACEMENT,
+            1,
+        ).replace(
+            installer.DESKTOP_UPDATE_INCLUDE_REPLACEMENT,
+            installer.INCLUDE_REPLACEMENT,
+            1,
+        )
+
+        upgraded = installer.transform_main(
+            current, hashlib.sha256(current.encode()).hexdigest()
+        )
+
+        self.assertIn(installer.DESKTOP_UPDATE_ROUTER_MARKER, upgraded)
+        self.assertIn(installer.DESKTOP_UPDATE_IMPORT_REPLACEMENT, upgraded)
+        self.assertIn(installer.DESKTOP_UPDATE_INCLUDE_REPLACEMENT, upgraded)
+        compile(upgraded, "main.py", "exec")
 
     def test_current_installed_status_block_upgrades_safely(self):
         digest = hashlib.sha256(MINIMAL_MAIN.encode()).hexdigest()
@@ -379,6 +417,34 @@ class TestOverlayInstaller(unittest.TestCase):
                 corrupted, hashlib.sha256(corrupted.encode()).hexdigest()
             )
 
+    def test_duplicate_or_post_spa_desktop_update_router_is_refused(self):
+        digest = hashlib.sha256(MINIMAL_MAIN.encode()).hexdigest()
+        with patch.object(installer, "EXPECTED_MAIN_SHA256", digest):
+            transformed = installer.transform_main(MINIMAL_MAIN, digest)
+
+        duplicated = transformed + "\n" + installer.DESKTOP_UPDATE_ROUTER_MARKER
+        with self.assertRaisesRegex(RuntimeError, "duplicated or incomplete"):
+            installer.transform_main(
+                duplicated, hashlib.sha256(duplicated.encode()).hexdigest()
+            )
+
+        for duplicate_line in (
+            installer.DESKTOP_UPDATE_IMPORT_LINE,
+            installer.DESKTOP_UPDATE_INCLUDE_LINE,
+        ):
+            with self.subTest(duplicate_line=duplicate_line), self.assertRaisesRegex(
+                RuntimeError, "duplicated or incomplete"
+            ):
+                installer.transform_main(
+                    transformed + "\n" + duplicate_line + "\n",
+                    hashlib.sha256(transformed.encode()).hexdigest(),
+                )
+
+        include = installer.DESKTOP_UPDATE_INCLUDE_REPLACEMENT
+        moved = transformed.replace(include, "", 1) + "\n" + include + "\n"
+        with self.assertRaisesRegex(RuntimeError, "before the root SPA mount"):
+            installer.transform_main(moved, hashlib.sha256(moved.encode()).hexdigest())
+
     def test_partial_or_corrupted_openai_overlay_is_refused(self):
         digest = hashlib.sha256(MINIMAL_OPENAI.encode()).hexdigest()
         with patch.object(installer, "EXPECTED_OPENAI_SHA256", digest):
@@ -479,7 +545,24 @@ class TestOverlayInstaller(unittest.TestCase):
             self.assertIn("seen_model_ids = set()", transformed)
             self.assertIn("content={'data': data}", transformed)
             self.assertIn(installer.STATUS_APPEND, transformed)
+            self.assertIn(installer.DESKTOP_UPDATE_ROUTER_MARKER, transformed)
             self.assertIn(frontend.UI_MARKER, model_editor_path.read_text())
+            self.assertTrue(
+                (
+                    backend
+                    / "open_webui"
+                    / "routers"
+                    / "zeta_desktop_updates.py"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    backend
+                    / "open_webui"
+                    / "utils"
+                    / "zeta_desktop_updates.py"
+                ).is_file()
+            )
             self.assertTrue((root / "src" / "lib" / "utils" / "zetaModelCatalog.ts").is_file())
             self.assertEqual((backup / "main.py").read_text(), MINIMAL_MAIN)
             self.assertEqual(
