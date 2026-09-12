@@ -14,6 +14,20 @@ That table already owns each model ID, display metadata, active flag, owner,
 and access grants. The overlay does not introduce a second catalogue file or
 copy provider addresses into a public response.
 
+## DeepSeek protocol routing
+
+The authenticated `/openai/messages` proxy keeps its public URL stable while
+routing DeepSeek models to the provider's separate Anthropic base:
+`https://api.deepseek.com/anthropic/v1/messages`. OpenAI Chat Completions and
+Responses continue to use the configured OpenAI base. DeepSeek calls request
+identity encoding because the deployed aiohttp runtime cannot decode the
+provider's Brotli responses. A failure while decoding or processing an
+upstream 2xx response is returned as `502`, never as a successful HTTP 200.
+
+The generic model-routed proxy rejects unresolved IDs instead of falling back
+to provider zero and applies the same ordinary-user model access filtering as
+the Responses route. Provider credentials remain server-side.
+
 Membership has two paths:
 
 1. An enabled registry row whose exact ID is currently advertised by the

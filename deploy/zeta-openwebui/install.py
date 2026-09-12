@@ -19,6 +19,8 @@ import shutil
 import tempfile
 from datetime import datetime, timezone
 
+import deepseek_routing_patch
+
 
 EXPECTED_MAIN_SHA256 = "fa65867e7d07ccb133cb0e0f22b763762512289601371f56eedb0fdbf05f715f"
 EXPECTED_OPENAI_SHA256 = "66ae2ff0705f711fe8dc5b6ce9d1ef07b06e8d1c1956c432ca779e0591691363"
@@ -501,7 +503,7 @@ def transform_openai(source: str, source_hash: str) -> str:
                 "Model-enablement markers exist but installation is incomplete: "
                 + ", ".join(missing)
             )
-        return source
+        return deepseek_routing_patch.transform(source)
 
     if "# BEGIN ZETA MODEL ENABLEMENT" in source:
         raise RuntimeError("Partial Zeta model-enablement installation detected")
@@ -533,7 +535,7 @@ def transform_openai(source: str, source_hash: str) -> str:
         ("OpenAI speech gate", OPENAI_SPEECH_ANCHOR, OPENAI_SPEECH_REPLACEMENT),
     ):
         source = replace_once(source, anchor, replacement, label)
-    return source
+    return deepseek_routing_patch.transform(source)
 
 
 def transform_models(source: str, source_hash: str) -> str:
